@@ -6,6 +6,7 @@ git clone https://github.com/jeun-990806/pim-jpeg-decoder.git
 cd pim-jpeg-decoder
 make
 ```
+* Tasklet 개수는 Makefile의 `NUM_TASKLETS` 변수 값으로 지정 가능하다.
 
 ## 2. Decoding
 ```
