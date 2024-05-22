@@ -800,7 +800,7 @@ int main(int argc, char *argv[]){
         int mcuWidth = (header->width + 7) / 8;
         int mcuHeight = (header->height + 7) / 8;
         MCU *mcus = new (std::nothrow) MCU[mcuHeight * mcuWidth];
-
+    
         // Offloading to DPUs
         try{
             int dpu_num =  1; // ceil((double)mcu_num / (double)header->restartInterval);
@@ -812,10 +812,10 @@ int main(int argc, char *argv[]){
             std::vector<uint32_t> buffer(BUFFER_SIZE, 0);
             for(int i=0; i<4; i++){
                 if(!header->huffmanDCTables[i].set){
-                    buffer[cursor++] = 0;
+                    buffer[cursor++] = FALSE;
                     break;
                 }
-                buffer[cursor++] = 1;
+                buffer[cursor++] = TRUE;
                 for(int j=0; j<17; j++) buffer[cursor++] = header->huffmanDCTables[i].offsets[j];
                 for(int j=0; j<162; j++) buffer[cursor++] = header->huffmanDCTables[i].symbols[j];      
                 for(int j=0; j<162; j++) buffer[cursor++] = header->huffmanDCTables[i].codes[j];
@@ -823,20 +823,20 @@ int main(int argc, char *argv[]){
 
             for(int i=0; i<4; i++){
                 if(!header->huffmanACTables[i].set){
-                    buffer[cursor++] = 0;
+                    buffer[cursor++] = FALSE;
                     break;
                 }
-                buffer[cursor++] = 1;
+                buffer[cursor++] = TRUE;
                 for(int j=0; j<17; j++) buffer[cursor++] = header->huffmanACTables[i].offsets[j];
                 for(int j=0; j<162; j++) buffer[cursor++] = header->huffmanACTables[i].symbols[j];      
                 for(int j=0; j<162; j++) buffer[cursor++] = header->huffmanACTables[i].codes[j];
             }
             for(int i=0; i<4; i++){
                 if(!header->quantizationTables[i].set){
-                    buffer[cursor++] = 0;
+                    buffer[cursor++] = FALSE;
                     break;
                 }
-                buffer[cursor++] = 1;
+                buffer[cursor++] = TRUE;
                 for(int j=0; j<64; j++) buffer[cursor++] = header->quantizationTables[i].table[j];
             }
             buffer[cursor++] = header->width;
@@ -859,13 +859,13 @@ int main(int argc, char *argv[]){
             }
             system.exec();
             
-            std::vector<std::vector<int>> y_r(1, std::vector<int>(64 * 5000, 0));
-            std::vector<std::vector<int>> cb_g(1, std::vector<int>(64 * 5000, 0));
-            std::vector<std::vector<int>> cr_b(1, std::vector<int>(64 * 5000, 0));
+            std::vector<std::vector<short>> y_r(1, std::vector<short>(64 * 5000, 0));
+            std::vector<std::vector<short>> cb_g(1, std::vector<short>(64 * 5000, 0));
+            std::vector<std::vector<short>> cr_b(1, std::vector<short>(64 * 5000, 0));
             auto dpu = system.dpus()[0];
-            dpu->copy(y_r, "y_r");
-            dpu->copy(cb_g, "cb_g");
-            dpu->copy(cr_b, "cr_b");
+            dpu->copy(y_r, "component01");
+            dpu->copy(cb_g, "component02");
+            dpu->copy(cr_b, "component03");
             for(int i=0; i<mcuHeight*mcuWidth; i++){
               for(int j=0; j<64; j++){
                 mcus[i][0][j] = y_r[0][i * 64 + j];
@@ -873,6 +873,7 @@ int main(int argc, char *argv[]){
                 mcus[i][2][j] = cr_b[0][i * 64 + j];
               }
             }
+            
             system.log(std::cout);
         }catch(const DpuError & e){
                 std::cerr << e.what() << "\n";
