@@ -859,10 +859,36 @@ int main(int argc, char *argv[]){
             }
             system.exec();
             
+            std::vector<std::vector<uint32_t>> initialization(1);
+            initialization.front().resize(1);
+            std::vector<std::vector<uint32_t>> huffman_decoding(1);
+            huffman_decoding.front().resize(1);
+            std::vector<std::vector<uint32_t>> dequantization(1);
+            dequantization.front().resize(1);
+            std::vector<std::vector<uint32_t>> inverse_dct(1);
+            inverse_dct.front().resize(1);
+            std::vector<std::vector<uint32_t>> color_space_conversion(1);
+            color_space_conversion.front().resize(1);
+            std::vector<std::vector<uint32_t>> clocks_per_sec(1);
+            clocks_per_sec.front().resize(1);
             std::vector<std::vector<short>> y_r(1, std::vector<short>(64 * 5000, 0));
             std::vector<std::vector<short>> cb_g(1, std::vector<short>(64 * 5000, 0));
             std::vector<std::vector<short>> cr_b(1, std::vector<short>(64 * 5000, 0));
+
             auto dpu = system.dpus()[0];
+            dpu->copy(clocks_per_sec, "CLOCKS_PER_SEC");
+            dpu->copy(initialization, "initialization");
+            dpu->copy(huffman_decoding, "huffman_decoding");
+            dpu->copy(dequantization, "dequantization");
+            dpu->copy(inverse_dct, "inverse_dct");
+            dpu->copy(color_space_conversion, "color_space_conversion");
+            std::cout << "Initialization: " << (float)initialization.front().front() / clocks_per_sec.front().front() << "s\n";
+            std::cout << "Huffman Decoding: " << (float)huffman_decoding.front().front() / clocks_per_sec.front().front() << "s\n";
+            std::cout << "Dequantization: " << (float)dequantization.front().front() / clocks_per_sec.front().front() << "s\n";
+            std::cout << "Inverse DCT: " << (float)inverse_dct.front().front() / clocks_per_sec.front().front() << "s\n";
+            std::cout << "Color Space Conversion: " << (float)color_space_conversion.front().front() / clocks_per_sec.front().front() << "s\n";
+
+            // Load decoded data
             dpu->copy(y_r, "component01");
             dpu->copy(cb_g, "component02");
             dpu->copy(cr_b, "component03");

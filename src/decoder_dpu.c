@@ -9,7 +9,11 @@
 #include "common.h"
 #include "types.h"
 
-#define CLOCK_CYCLES_PER_MS (800000 / 3)
+__host uint32_t initialization = 0;
+__host uint32_t huffman_decoding = 0;
+__host uint32_t dequantization = 0;
+__host uint32_t inverse_dct = 0;
+__host uint32_t color_space_conversion = 0;
 
 __mram uint32_t buffer[BUFFER_SIZE];
 __mram short component01[64 * 5000]; // Y or R
@@ -23,10 +27,9 @@ huffman_table huffman_AC_tables[4];
 quantization_table quantization_tables[4];
 jpeg_info metadata;
 
-BARRIER_INIT(init_barrier, NR_TASKLETS);
-
 int byte_cursor = 0,  bit_cursor = 0;
 int total_mcus, mcu_per_tasklet;
+uint32_t accumulated_cycles = 0;
 
 void init();
 void load_data();
@@ -46,23 +49,31 @@ void idct_component(int tasklet_ID, int component_ID);
 
 void convert_colorspace(int tasklet_ID);
 
+BARRIER_INIT(init_barrier, NR_TASKLETS);
+
 int main(){
-    if(me() == 0){
+    int tasklet_ID = me();
+    if(tasklet_ID == 0){
+        perfcounter_config(COUNT_CYCLES, true);
         init();
         load_data();
+        initialization = perfcounter_get();
+        accumulated_cycles += initialization;
         total_mcus = ((metadata.height + 7) / 8) * ((metadata.width + 7) / 8);
         mcu_per_tasklet = total_mcus / NR_TASKLETS;
         decode_huffman_data();
-        dequantize(me());
-        idct(me());
-        convert_colorspace(me());
-    }else{
-        barrier_wait(&init_barrier);
-        dequantize(me());
-        idct(me());
-        convert_colorspace(me());
+        huffman_decoding = perfcounter_get() - accumulated_cycles;
+        accumulated_cycles += huffman_decoding;
     }
     barrier_wait(&init_barrier);
+    dequantize(me());
+    if(tasklet_ID == 0) dequantization = perfcounter_get() - accumulated_cycles;
+    accumulated_cycles += dequantization;
+    idct(me());
+    if(tasklet_ID == 0) inverse_dct = perfcounter_get() - accumulated_cycles;
+    accumulated_cycles += inverse_dct;
+    convert_colorspace(me());
+    if(tasklet_ID == 0) color_space_conversion = perfcounter_get() - accumulated_cycles;
     
     return 0;
 }
@@ -169,10 +180,10 @@ byte get_next_symbol(huffman_table *table){
 }
 
 int decode_mcu_component(short *component, short *pre_dc_values, int component_ID){
-    huffman_table huffman_DC_table = huffman_DC_tables[metadata.color_components[component_ID].huffman_DC_table_ID];
-    huffman_table huffman_AC_table = huffman_AC_tables[metadata.color_components[component_ID].huffman_AC_table_ID];
+    huffman_table *huffman_DC_table = &huffman_DC_tables[metadata.color_components[component_ID].huffman_DC_table_ID];
+    huffman_table *huffman_AC_table = &huffman_AC_tables[metadata.color_components[component_ID].huffman_AC_table_ID];
     
-    byte length = get_next_symbol(&huffman_DC_table);
+    byte length = get_next_symbol(huffman_DC_table);
     
     if(length == (byte)-1){
         printf("Error - Invalid DC value (length ==  %d)\n", length);
@@ -182,7 +193,7 @@ int decode_mcu_component(short *component, short *pre_dc_values, int component_I
         printf("Error - DC coefficient length greater than 11\n");
         return -1;
     }
-
+    
     int coefficient = read_bits(length);
     if(coefficient == -1){
         printf("Error - Invalid DC value\n");
@@ -192,11 +203,11 @@ int decode_mcu_component(short *component, short *pre_dc_values, int component_I
         coefficient -= (1 << length) - 1;
     component[0] = coefficient + (*pre_dc_values);
     (*pre_dc_values) = component[0];
-
-    uint i = 1;
     
+    uint i = 1;
     while(i < 64){
-        byte symbol = get_next_symbol(&huffman_AC_table);
+        byte symbol = get_next_symbol(huffman_AC_table);
+        
         if(symbol == (byte)-1){
             printf("Error - Invalid AC value\n");
             return -1;
@@ -223,7 +234,6 @@ int decode_mcu_component(short *component, short *pre_dc_values, int component_I
             printf("Error - AC coefficient length greater than 10\n");
             return -1;
         }
-
         if(coefficient_length != 0){
             coefficient = read_bits(coefficient_length);
             if(coefficient == -1){
@@ -264,7 +274,6 @@ void decode_huffman_data(){
     }
 
     short pre_dc_values[3] = {0, 0, 0};
-
     for(int i=0; i<total_mcus; i++){
         if(metadata.restart_interval != 0 && i % metadata.restart_interval == 0){
             pre_dc_values[0] = 0; pre_dc_values[1] = 0; pre_dc_values[2] = 0;
@@ -277,6 +286,7 @@ void decode_huffman_data(){
             }
         }
         store_mcu(0, i);
+        
     }
 }
 
