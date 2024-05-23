@@ -248,7 +248,6 @@ int decode_mcu_component(short *component, short *pre_dc_values, int component_I
     return 1;
 }
 
-
 void decode_huffman_data(){
     for(int u=0; u<4; u++){
         if(huffman_DC_tables[u].set == 1){
@@ -291,14 +290,19 @@ void decode_huffman_data(){
 }
 
 void dequantize(int tasklet_ID){
-    for(uint i=tasklet_ID*mcu_per_tasklet; i<tasklet_ID*mcu_per_tasklet+mcu_per_tasklet; i++){
+    int start_mcu = tasklet_ID * mcu_per_tasklet;
+    int end_mcu = tasklet_ID * mcu_per_tasklet + mcu_per_tasklet;
+    if(tasklet_ID == NR_TASKLETS-1 && total_mcus % NR_TASKLETS != 0)
+        end_mcu += total_mcus % NR_TASKLETS;
+
+    for(uint i=start_mcu; i<end_mcu; i++){
         load_mcu(tasklet_ID, i);
         for(uint j=0; j<64; j++)
             for(uint k=0; k<metadata.num_components; k++)
                 current_mcus[tasklet_ID].component[k][j] *= quantization_tables[metadata.color_components[k].quantization_table_ID].table[j];
         store_mcu(tasklet_ID, i);
     }
-    printf("tasklet %d: MCU %d ~ %d (%d MCUs)\n", tasklet_ID, tasklet_ID*mcu_per_tasklet, tasklet_ID*mcu_per_tasklet+mcu_per_tasklet, mcu_per_tasklet);
+    printf("tasklet %d: MCU %d ~ %d (%d MCUs)\n", tasklet_ID, start_mcu, end_mcu, end_mcu-start_mcu);
 }
 
 void idct_component(int tasklet_ID, int component_ID){
@@ -326,7 +330,12 @@ void idct_component(int tasklet_ID, int component_ID){
 }
 
 void idct(int tasklet_ID){
-    for(uint i=tasklet_ID*mcu_per_tasklet; i<tasklet_ID*mcu_per_tasklet+mcu_per_tasklet; i++){
+    int start_mcu = tasklet_ID * mcu_per_tasklet;
+    int end_mcu = tasklet_ID * mcu_per_tasklet + mcu_per_tasklet;
+    if(tasklet_ID == NR_TASKLETS-1 && total_mcus % NR_TASKLETS != 0)
+        end_mcu += total_mcus % NR_TASKLETS;
+
+    for(uint i=start_mcu; i<end_mcu; i++){
         load_mcu(tasklet_ID, i);
         for(uint j=0; j<metadata.num_components; j++)
             idct_component(tasklet_ID, j);
@@ -335,8 +344,13 @@ void idct(int tasklet_ID){
 }
 
 void convert_colorspace(int tasklet_ID){
+    int start_mcu = tasklet_ID * mcu_per_tasklet;
+    int end_mcu = tasklet_ID * mcu_per_tasklet + mcu_per_tasklet;
+    if(tasklet_ID == NR_TASKLETS-1 && total_mcus % NR_TASKLETS != 0)
+        end_mcu += total_mcus % NR_TASKLETS;
+
     short r, g, b;
-    for(uint i=tasklet_ID*mcu_per_tasklet; i<tasklet_ID*mcu_per_tasklet+mcu_per_tasklet; i++){
+    for(uint i=start_mcu; i<end_mcu; i++){
         load_mcu(tasklet_ID, i);
         for(int j=0; j<64; j++){
             r = current_mcus[tasklet_ID].component[0][j] + 1.402f * current_mcus[tasklet_ID].component[2][j] + 128;
