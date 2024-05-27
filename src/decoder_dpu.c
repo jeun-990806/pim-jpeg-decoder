@@ -9,6 +9,8 @@
 #include "common.h"
 #include "types.h"
 
+#define MAX_MCU_NUM 100000
+
 __host uint32_t initialization = 0;
 __host uint32_t huffman_decoding = 0;
 __host uint32_t dequantization = 0;
@@ -16,9 +18,9 @@ __host uint32_t inverse_dct = 0;
 __host uint32_t color_space_conversion = 0;
 
 __mram uint32_t buffer[BUFFER_SIZE];
-__mram short component01[64 * 5000]; // Y or R
-__mram short component02[64 * 5000]; // Cb or G
-__mram short component03[64 * 5000]; // Cr or B
+__mram short component01[64 * MAX_MCU_NUM]; // Y or R
+__mram short component02[64 * MAX_MCU_NUM]; // Cb or G
+__mram short component03[64 * MAX_MCU_NUM]; // Cr or B
 
 __dma_aligned MCU current_mcus[NR_TASKLETS];
 
