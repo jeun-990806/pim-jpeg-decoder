@@ -1,4 +1,6 @@
 #define BUFFER_SIZE 16777216/4
+#define MAX_MCU_PER_DPU 5000
+
 #define TRUE 1
 #define FALSE -1
 

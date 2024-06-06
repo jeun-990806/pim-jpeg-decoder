@@ -23,9 +23,14 @@ typedef struct {
 } color_component;
 
 typedef struct {
-  int width;
-  int height;
-  color_component color_components[3];
+  int mcu_height;
+  int mcu_width;
+  int mcu_height_real;
+  int mcu_width_real;
+
   int num_components;
-  int restart_interval;
+  color_component color_components[3];
+
+  byte vertical_sampling_factor;
+  byte horizontal_sampling_factor;
 } jpeg_info;
