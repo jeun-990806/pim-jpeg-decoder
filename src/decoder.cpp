@@ -66,15 +66,16 @@ int main(int argc, char *argv[]){
 
         // Offloading to DPUs
         try{
-            int dpuNums = (header->mcuHeightReal * header->mcuWidthReal) / MAX_MCU_PER_DPU;
-            if((header->mcuHeightReal * header->mcuWidthReal) % MAX_MCU_PER_DPU != 0) dpuNums += 1;
+            int mcuLinesPerDPU = header->mcuHeightReal;
+            for(; mcuLinesPerDPU*header->mcuWidthReal>MAX_MCU_PER_DPU || header->mcuHeightReal%mcuLinesPerDPU!=0; mcuLinesPerDPU--);
+            int dpuNums = header->mcuHeightReal / mcuLinesPerDPU;
+            int mcuPerDPU = mcuLinesPerDPU * header->mcuWidthReal;
             auto system = DpuSet::allocate(dpuNums);
             std::cout << dpuNums << " DPUs are allocated.\n";
+            std::cout << mcuPerDPU << " MCUs per DPU\n";
 
-            int mcuPerDPU = (header->mcuHeightReal * header->mcuWidthReal) / dpuNums;
-            int remains = 0;
-            if(dpuNums > 1 && (header->mcuHeightReal * header->mcuWidthReal) % dpuNums != 0) remains = (header->mcuHeightReal * header->mcuWidthReal) % dpuNums;
-            std::cout << "(" << mcuPerDPU << " MCUs per DPU)\n";
+            std::vector<uint32_t> mcuNum(4);
+            mcuNum[0] = mcuPerDPU;
 
             std::vector<uint32_t> metaDataBuffer(16);
             metaDataBuffer[0] = header->mcuHeight;
@@ -101,9 +102,9 @@ int main(int argc, char *argv[]){
             }
             std::cout << "Quantization tables are prepared\n";
 
-            std::vector<short> component01(64 * (mcuPerDPU + remains));
-            std::vector<short> component02(64 * (mcuPerDPU + remains));
-            std::vector<short> component03(64 * (mcuPerDPU + remains));
+            std::vector<short> component01(64 * mcuPerDPU);
+            std::vector<short> component02(64 * mcuPerDPU);
+            std::vector<short> component03(64 * mcuPerDPU);
             std::cout << "Total MCUs " << (header->mcuHeightReal * header->mcuWidthReal) << "\n";
 
             system.load(DPU_BINARY);
@@ -117,9 +118,10 @@ int main(int argc, char *argv[]){
                 }
                 auto dpu = system.dpus()[i];
                 dpu->copy("quantization_tables", quantizationTables, sizeof(uint32_t) * 4 * 64);
-                dpu->copy("component01", component01, sizeof(short) * 64 * (mcuPerDPU + remains));
-                dpu->copy("component02", component02, sizeof(short) * 64 * (mcuPerDPU + remains));
-                dpu->copy("component03", component03, sizeof(short) * 64 * (mcuPerDPU + remains));
+                dpu->copy("component01", component01, sizeof(short) * 64 * mcuPerDPU);
+                dpu->copy("component02", component02, sizeof(short) * 64 * mcuPerDPU);
+                dpu->copy("component03", component03, sizeof(short) * 64 * mcuPerDPU);
+                dpu->copy("mcu_num", mcuNum, sizeof(uint32_t) * 4);
                 dpu->copy("metadata_buffer", metaDataBuffer, sizeof(uint32_t) * 16);
             }
             system.exec();
@@ -147,10 +149,10 @@ int main(int argc, char *argv[]){
             std::cout << "Color Space Conversion: " << (float)color_space_conversion.front().front() / clocks_per_sec.front().front() << "s\n";
             
             // Load decoded data
-            std::vector<std::vector<short>> y_r(1, std::vector<short>(64 * MAX_MCU_PER_DPU, 0));
-            std::vector<std::vector<short>> cb_g(1, std::vector<short>(64 * MAX_MCU_PER_DPU, 0));
-            std::vector<std::vector<short>> cr_b(1, std::vector<short>(64 * MAX_MCU_PER_DPU, 0));
-            for(uint i=0; i<dpuNums-1; i++){
+            std::vector<std::vector<short>> y_r(1, std::vector<short>(64 * mcuPerDPU, 0));
+            std::vector<std::vector<short>> cb_g(1, std::vector<short>(64 * mcuPerDPU, 0));
+            std::vector<std::vector<short>> cr_b(1, std::vector<short>(64 * mcuPerDPU, 0));
+            for(uint i=0; i<dpuNums; i++){
                 dpu = system.dpus()[i];
                 dpu->copy(y_r, "component01");
                 dpu->copy(cb_g, "component02");
@@ -161,17 +163,6 @@ int main(int argc, char *argv[]){
                         mcusFromDPU[j][1][k] = cb_g[0][(j - mcuPerDPU*i) * 64 + k];
                         mcusFromDPU[j][2][k] = cr_b[0][(j - mcuPerDPU*i) * 64 + k];
                     }
-                }
-            }
-            dpu = system.dpus()[dpuNums-1];
-            dpu->copy(y_r, "component01");
-            dpu->copy(cb_g, "component02");
-            dpu->copy(cr_b, "component03");
-            for(int j=mcuPerDPU*(dpuNums-1); j<mcuPerDPU*(dpuNums-1)+mcuPerDPU+remains; j++){
-                for(int k=0; k<64; k++){
-                    mcusFromDPU[j][0][k] = y_r[0][(j-mcuPerDPU*(dpuNums-1)) * 64 + k];
-                    mcusFromDPU[j][1][k] = cb_g[0][(j-mcuPerDPU*(dpuNums-1)) * 64 + k];
-                    mcusFromDPU[j][2][k] = cr_b[0][(j-mcuPerDPU*(dpuNums-1)) * 64 + k];
                 }
             }
             system.log(std::cout);
@@ -215,25 +206,35 @@ void readStartOfScan(std::ifstream& inFile, Header *const header){
     uint length = (inFile.get() << 8) + inFile.get();
 
     for(uint i=0; i<header->numComponents; i++){
-        header->colorComponents[i].used = false;
+        header->colorComponents[i].usedInScan = false;
     }
 
-    byte numComponents = inFile.get();
-    for(uint i=0; i<numComponents; i++){
+    header->componentsInScan = inFile.get();
+    if(header->componentsInScan == 0){
+        std::cout << "Error - Scan must include at least 1 component\n";
+        header->valid = false;
+        return;
+    }
+    for(uint i=0; i<header->componentsInScan; i++){
         byte componentID = inFile.get();
         if(header->zeroBased) componentID += 1;
-        if(componentID > header->numComponents){
+        if(componentID == 0 || componentID > header->numComponents){
             std::cout << "Error - Invalid color component ID: " << (uint)componentID << "\n";
             header->valid = false;
             return;
         }
         ColorComponent *component = &header->colorComponents[componentID - 1];
-        if(component->used){
+        if(!component->usedInFrame){
+            std::cout << "Error - Invalid color component ID: " << (uint)componentID << "\n";
+            header->valid = false;
+            return;
+        }
+        if(component->usedInScan){
             std::cout << "Duplicate color component ID\n";
             header->valid = false;
             return;            
         }
-        component->used = true;
+        component->usedInScan = true;
 
         byte huffmanTableIDs = inFile.get();
         component->huffmanDCTableID = huffmanTableIDs >> 4;
@@ -256,18 +257,72 @@ void readStartOfScan(std::ifstream& inFile, Header *const header){
     header->successiveApproximationHigh = successiveApproximation >> 4;
     header->successiveApproximationLow = successiveApproximation & 0x0F;
 
-    if(header->startOfSelection !=0 || header->endOfSelection != 63){
-        std::cout << "Error - Invalid spectral selection\n";
-        header->valid = false;
-        return;
-    }
-    if(header->successiveApproximationHigh != 0 || header->successiveApproximationLow != 0){
-        std::cout << "Error - Invalid successive approximation\n";
-        header->valid = false;
-        return;
+    if(header->frameType == SOF0){
+        if(header->startOfSelection !=0 || header->endOfSelection != 63){
+            std::cout << "Error - Invalid spectral selection\n";
+            header->valid = false;
+            return;
+        }
+        if(header->successiveApproximationHigh != 0 || header->successiveApproximationLow != 0){
+            std::cout << "Error - Invalid successive approximation\n";
+            header->valid = false;
+            return;
+        }
+    }else if(header->frameType == SOF2){
+        if(header->startOfSelection > header->endOfSelection){
+            std::cout << "Error - Invalid spectral selection (start greater than end)\n";
+            header->valid = false;
+            return;
+        }
+        if(header->endOfSelection > 63){
+            std::cout << "Error - Invalid spectral selection (end greater than 63)\n";
+            header->valid = false;
+            return;
+        }
+        if(header->startOfSelection == 0 && header->endOfSelection != 0){
+            std::cout << "Error - Invalid spectral selection (contains DC and AC)\n";
+            header->valid = false;
+            return;
+        }
+        if(header->startOfSelection != 0 && header->componentsInScan != 1){
+            std::cout << "Error - Invalid spectral selection (AC scan contains multiple components)\n";
+            header->valid = false;
+            return;
+        }
+        if(header->successiveApproximationHigh != 0 &&
+           header->successiveApproximationLow != header->successiveApproximationHigh -1){
+            std::cout << "Error - Invalid succesive approximation\n";
+            header->valid = false;
+            return;
+        }
     }
 
-    if(length - 6 - (2 * numComponents) != 0){
+    for(uint i=0; i<header->numComponents; i++){
+        const ColorComponent& component = header->colorComponents[i];
+        if(header->colorComponents[i].usedInScan){
+            if(header->quantizationTables[component.quantizationTableID].set == false){
+                std::cout << "Error - Color component using uninitialized quantization table\n";
+                header->valid = false;
+                return;
+            }
+            if(header->startOfSelection == 0){
+                if(header->huffmanDCTables[component.huffmanDCTableID].set == false){
+                    std::cout << "Error - Color component using uninitialized Huffman DC table\n";
+                    header->valid = false;
+                    return;
+                }
+            }
+            if(header->endOfSelection > 0){
+                if(header->huffmanACTables[component.huffmanACTableID].set == false){
+                    std::cout << "Error - Color component using uninitialized Huffman AC table\n";
+                    header->valid = false;
+                    return;
+                }
+            }
+        }
+    }
+
+    if(length - 6 - (2 * header->componentsInScan) != 0){
         std::cout << "Error - SOS invalid\n";
         header->valid = false;
         return;
@@ -364,25 +419,25 @@ void readStartOfFrame(std::ifstream& inFile, Header *const header){
     }
     for(uint i=0; i<header->numComponents; i++){
         byte componentID = inFile.get();
-        if(componentID == 0) header->zeroBased = true;
+        if(componentID == 0 && i == 0) header->zeroBased = true;
         if(header->zeroBased) componentID += 1;
         if(componentID == 4 || componentID == 5){
             std::cout << "Error - YIQ color mode not supported\n";
             header->valid = false;
             return;
         }
-        if(componentID == 0 || componentID > 3){
+        if(componentID == 0 || componentID > header->numComponents){
             std::cout << "Error - Invalid component ID:" << (uint)componentID << "\n";
             header->valid = false;
             return;
         }
         ColorComponent *component = &header->colorComponents[componentID - 1];
-        if(component->used){
+        if(component->usedInFrame){
             std::cout << "Duplicate color component ID\n";
             header->valid = false;
             return;
         }
-        component->used = true;
+        component->usedInFrame = true;
         byte samplingFactor = inFile.get();
         component->horizontalSamplingFactor = samplingFactor >> 4;
         component->verticalSamplingFactor = samplingFactor & 0x0F;
@@ -399,6 +454,8 @@ void readStartOfFrame(std::ifstream& inFile, Header *const header){
             if(component->verticalSamplingFactor == 2 && header->mcuHeight % 2 == 1){
                 header->mcuHeightReal += 1;
             }
+            header->horizontalSamplingFactor = component->horizontalSamplingFactor;
+            header->verticalSamplingFactor = component->verticalSamplingFactor;
         }else{
             if(component->horizontalSamplingFactor != 1 || component->verticalSamplingFactor != 1){
                 std::cout << "Error - Sampling factors not supported\n";
@@ -406,6 +463,8 @@ void readStartOfFrame(std::ifstream& inFile, Header *const header){
                 return;
             }
         }
+
+        std::cout << "vertical sampling factor: " << (uint)header->verticalSamplingFactor << ", horizontal sampling factor: " << (uint)header->horizontalSamplingFactor << "\n";
         
         component->quantizationTableID = inFile.get();
         if(component->quantizationTableID > 3){
@@ -517,8 +576,8 @@ Header *readJPG(const std::string& filename){
             return header;
         }
 
-        if(current == SOF0){
-            header->frameType = SOF0;
+        if(current == SOF0 || current == SOF2){
+            header->frameType = current;
             readStartOfFrame(inFile, header);
         }else if(current == DQT){
             readQuantizationTable(inFile, header);
@@ -786,22 +845,39 @@ void inverseDCT(const Header *const header, MCU *const mcus){
     }
 }
 
-void YCbCrToRGB(const Header *const header, MCU *const mcus){
-    for(uint i=0; i<header->mcuHeight * header->mcuWidthReal; i++){
-        for(int j=0; j<64; j++){
-            int r = mcus[i].y[j] + 1.402f * mcus[i].cr[j] + 128;
-            int g = mcus[i].y[j] - 0.344f * mcus[i].cb[j] - 0.714 * mcus[i].cr[j] + 128;
-            int b = mcus[i].y[j] + 1.772f * mcus[i].cb[j] + 128;
+void YCbCrToRGBMCU(const Header *const header, MCU& mcu, const MCU& cbcr, const uint v, const uint h){
+    for(uint y=7; y<8; y--){
+        for(uint x=7; x<8; x--){
+            const uint pixel = y * 8 + x;
+            const uint cbcrPixelRow = y / header->verticalSamplingFactor + 4 * v;
+            const uint cbcrPixelColumn = x / header->horizontalSamplingFactor + 4 * h;
+            const uint cbcrPixel = cbcrPixelRow * 8 + cbcrPixelColumn;
+            int r = mcu.y[pixel] + 1.402f * cbcr.cr[cbcrPixel] + 128;
+            int g = mcu.y[pixel] - 0.344f * cbcr.cb[cbcrPixel] - 0.714 * cbcr.cr[cbcrPixel] + 128;
+            int b = mcu.y[pixel] + 1.772f * cbcr.cb[cbcrPixel] + 128;
             if(r < 0) r = 0;
             if(r > 255) r = 255;
             if(g < 0) g = 0;
             if(g > 255) g = 255;
             if(b < 0) b = 0;
             if(b > 255) b = 255;
-            mcus[i].r[j] = r;
-            mcus[i].g[j] = g;
-            mcus[i].b[j] = b;
-        }   
+            mcu.r[pixel] = r;
+            mcu.g[pixel] = g;
+            mcu.b[pixel] = b;
+        }
+    }
+}
+
+void YCbCrToRGB(const Header *const header, MCU *const mcus){
+    for(uint y=0; y<header->mcuHeight; y+=header->verticalSamplingFactor){
+        for(uint x=0; x<header->mcuWidth; x+=header->horizontalSamplingFactor){
+            const MCU& cbcr = mcus[y * header->mcuWidthReal + x];
+            for(uint v=header->verticalSamplingFactor-1; v<header->verticalSamplingFactor; v--){
+                for(uint h=header->horizontalSamplingFactor-1; h<header->horizontalSamplingFactor; h--){
+                    YCbCrToRGBMCU(header, mcus[(y + v) * header->mcuWidthReal + (x + h)], cbcr, v, h);
+                }
+            }
+        }
     }
 }
 

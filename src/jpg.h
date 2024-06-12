@@ -109,7 +109,8 @@ struct ColorComponent {
     byte quantizationTableID = 0;
     byte huffmanDCTableID = 0;
     byte huffmanACTableID = 0;
-    bool used = false;
+    bool usedInFrame = false;
+    bool usedInScan = false;
 };
 
 struct Header {
@@ -124,6 +125,7 @@ struct Header {
     ColorComponent colorComponents[3];
     bool zeroBased = false;
 
+    byte componentsInScan = 0;
     byte startOfSelection = 0;
     byte endOfSelection = 63;
     byte successiveApproximationHigh = 0;
