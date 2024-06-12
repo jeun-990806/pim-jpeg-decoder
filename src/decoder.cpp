@@ -165,7 +165,6 @@ int main(int argc, char *argv[]){
                     }
                 }
             }
-            system.log(std::cout);
         }catch(const DpuError & e){
                 std::cerr << e.what() << "\n";
         }

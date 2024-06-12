@@ -91,9 +91,9 @@ void load_data(){
     metadata.mcu_width_real = metadata_buffer[3];
     metadata.num_components = metadata_buffer[4];
     metadata.vertical_sampling_factor = metadata_buffer[5];
-    printf("vertical sampling factor: %d\n", metadata.vertical_sampling_factor);
+    //printf("vertical sampling factor: %d\n", metadata.vertical_sampling_factor);
     metadata.horizontal_sampling_factor = metadata_buffer[6];
-    printf("horizontal sampling factor: %d\n", metadata.horizontal_sampling_factor);
+    //printf("horizontal sampling factor: %d\n", metadata.horizontal_sampling_factor);
     for(uint i=0; i<metadata.num_components; i++){
         metadata.color_components[i].quantization_table_ID = metadata_buffer[i + 7];
     }
@@ -171,7 +171,7 @@ void dequantize(int tasklet_ID){
         }
       }
     }
-    printf("tasklet %d: MCU %d (%d, %d) ~ %d (%d, %d) (%d MCUs)\n", tasklet_ID, start_mcu, start_row, start_column, end_mcu-1, end_row-1, end_column, end_mcu-start_mcu);
+    //printf("tasklet %d: MCU %d (%d, %d) ~ %d (%d, %d) (%d MCUs)\n", tasklet_ID, start_mcu, start_row, start_column, end_mcu-1, end_row-1, end_column, end_mcu-start_mcu);
 }
 
 void idct_component(int tasklet_ID, int component_ID){
