@@ -165,6 +165,7 @@ int main(int argc, char *argv[]){
                     }
                 }
             }
+            // system.log(std::cout);
         }catch(const DpuError & e){
                 std::cerr << e.what() << "\n";
         }
@@ -633,7 +634,7 @@ Header *readJPG(const std::string& filename){
                     header->valid = false;
                     inFile.close();
                     return header;       
-                }         
+                }
             }else{
                 header->huffmanData.push_back(last);
             }
