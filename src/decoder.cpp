@@ -64,6 +64,7 @@ int main(int argc, char *argv[]){
         inverseDCT(header, mcusFromHost);
         YCbCrToRGB(header, mcusFromHost);
 
+
         // Offloading to DPUs
         try{
             int mcuLinesPerDPU = header->mcuHeightReal;
