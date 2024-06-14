@@ -68,7 +68,7 @@ int main(int argc, char *argv[]){
         // Offloading to DPUs
         try{
             int mcuLinesPerDPU = header->mcuHeightReal;
-            for(; mcuLinesPerDPU*header->mcuWidthReal>MAX_MCU_PER_DPU || header->mcuHeightReal%mcuLinesPerDPU!=0; mcuLinesPerDPU--);
+            for(; mcuLinesPerDPU*header->mcuWidthReal>MAX_MCU_PER_DPU; mcuLinesPerDPU--);
             int dpuNums = header->mcuHeightReal / mcuLinesPerDPU;
             int mcuPerDPU = mcuLinesPerDPU * header->mcuWidthReal;
             auto system = DpuSet::allocate(dpuNums);
@@ -144,10 +144,10 @@ int main(int argc, char *argv[]){
             dpu->copy(dequantization, "dequantization");
             dpu->copy(inverse_dct, "inverse_dct");
             dpu->copy(color_space_conversion, "color_space_conversion");
-            std::cout << "Initialization: " << (float)initialization.front().front() / clocks_per_sec.front().front() << "s\n";
-            std::cout << "Dequantization: " << (float)dequantization.front().front() / clocks_per_sec.front().front() << "s\n";
-            std::cout << "Inverse DCT: " << (float)inverse_dct.front().front() / clocks_per_sec.front().front() << "s\n";
-            std::cout << "Color Space Conversion: " << (float)color_space_conversion.front().front() / clocks_per_sec.front().front() << "s\n";
+            std::cout << "Initialization: " << (float)initialization.front().front() / clocks_per_sec.front().front() << "s (" << initialization.front().front() << " cycles)\n";
+            std::cout << "Dequantization: " << (float)dequantization.front().front() / clocks_per_sec.front().front() << "s (" << dequantization.front().front() << " cycles)\n";
+            std::cout << "Inverse DCT: " << (float)inverse_dct.front().front() / clocks_per_sec.front().front() << "s (" << inverse_dct.front().front() << " cycles)\n";
+            std::cout << "Color Space Conversion: " << (float)color_space_conversion.front().front() / clocks_per_sec.front().front() << "s (" << color_space_conversion.front().front() << " cycles)\n";
             
             // Load decoded data
             std::vector<std::vector<short>> y_r(1, std::vector<short>(64 * mcuPerDPU, 0));
@@ -166,7 +166,7 @@ int main(int argc, char *argv[]){
                     }
                 }
             }
-            // system.log(std::cout);
+            system.log(std::cout);
         }catch(const DpuError & e){
                 std::cerr << e.what() << "\n";
         }
