@@ -119,53 +119,25 @@ void store_mcu(int tasklet_ID, int offset){
     mram_write(current_mcus[tasklet_ID].component[2], component03 + offset * 64, sizeof(current_mcus[tasklet_ID].component[2]));
 }
 
-void dequantize(int tasklet_ID){
+void dequantize(int tasklet_ID) {
     int start_mcu = tasklet_ID * mcu_per_tasklet;
     int end_mcu = start_mcu + mcu_per_tasklet;
-    if(tasklet_ID == NR_TASKLETS-1 && mcu_num[0] % NR_TASKLETS != 0)
+    if(tasklet_ID == NR_TASKLETS - 1 && mcu_num[0] % NR_TASKLETS != 0)
         end_mcu += mcu_num[0] % NR_TASKLETS;
-    int start_row = start_mcu / metadata.mcu_width_real;
-    int start_column = start_mcu % metadata.mcu_width_real;
-    int end_row = end_mcu / metadata.mcu_width_real;
-    int end_column = end_mcu % metadata.mcu_width_real;
-    printf("tasklet %d: start %d (%d, %d) ~ end %d (%d, %d)\n", tasklet_ID, start_mcu, start_row, start_column, end_mcu, end_row, end_column);
-    
-    for(uint x=start_column; x<metadata.mcu_width_real; x+=metadata.horizontal_sampling_factor){
-        for(uint i=0; i<metadata.num_components; i++){
-            for(uint v=0; v<metadata.color_components[i].vertical_sampling_factor; v++){
-                for(uint h=0; h<metadata.color_components[i].horizontal_sampling_factor; h++){
-                    load_mcu(tasklet_ID, (start_row + v) * metadata.mcu_width_real + (x + h));
-                    for(uint j=0; j<64; j++)
-                        current_mcus[tasklet_ID].component[i][j] *= quantization_tables_cached[metadata.color_components[i].quantization_table_ID * 64 + j];
-                    store_mcu(tasklet_ID, (start_row + v) * metadata.mcu_width_real + (x + h));
-                }
-            }
-        }
-    }
 
-    for(uint y=start_row+1; y<=end_row-1; y+=metadata.vertical_sampling_factor){
-        for(uint x=0; x<metadata.mcu_width_real; x+=metadata.horizontal_sampling_factor){
-            for(uint i=0; i<metadata.num_components; i++){
-                for(uint v=0; v<metadata.color_components[i].vertical_sampling_factor; v++){
-                    for(uint h=0; h<metadata.color_components[i].horizontal_sampling_factor; h++){
-                        load_mcu(tasklet_ID, (y + v) * metadata.mcu_width_real + (x + h));
-                        for(uint j=0; j<64; j++)
-                            current_mcus[tasklet_ID].component[i][j] *= quantization_tables_cached[metadata.color_components[i].quantization_table_ID * 64 + j];
-                        store_mcu(tasklet_ID, (y + v) * metadata.mcu_width_real + (x + h));
+    for(int mcu_index=start_mcu; mcu_index<end_mcu; mcu_index++) {
+        int row = mcu_index / metadata.mcu_width_real;
+        int column = mcu_index % metadata.mcu_width_real;
+        
+        for (uint i=0; i<metadata.num_components; i++) {
+            for (uint v=0; v<metadata.color_components[i].vertical_sampling_factor; v++) {
+                for (uint h=0; h<metadata.color_components[i].horizontal_sampling_factor; h++) {
+                    int current_mcu_index = (row + v) * metadata.mcu_width_real + (column + h);
+                    load_mcu(tasklet_ID, current_mcu_index);
+                    for (uint j=0; j<64; j++) {
+                        current_mcus[tasklet_ID].component[i][j] *= quantization_tables_cached[metadata.color_components[i].quantization_table_ID * 64 + j];
                     }
-                }
-            }
-        }
-    }
-
-    for(uint x=0; x<end_column+1; x+=metadata.horizontal_sampling_factor){
-        for(uint i=0; i<metadata.num_components; i++){
-            for(uint v=0; v<metadata.color_components[i].vertical_sampling_factor; v++){
-                for(uint h=0; h<metadata.color_components[i].horizontal_sampling_factor; h++){
-                    load_mcu(tasklet_ID, (end_row + v) * metadata.mcu_width_real + (x + h));
-                    for(uint j=0; j<64; j++)
-                        current_mcus[tasklet_ID].component[i][j] *= quantization_tables_cached[metadata.color_components[i].quantization_table_ID * 64 + j];
-                    store_mcu(tasklet_ID, (end_row + v) * metadata.mcu_width_real + (x + h));
+                    store_mcu(tasklet_ID, current_mcu_index);
                 }
             }
         }
@@ -223,46 +195,20 @@ void idct_component_shift_and_add(int tasklet_ID, int component_ID){
 void idct(int tasklet_ID){
     int start_mcu = tasklet_ID * mcu_per_tasklet;
     int end_mcu = start_mcu + mcu_per_tasklet;
-    if(tasklet_ID == NR_TASKLETS-1 && mcu_num[0] % NR_TASKLETS != 0)
+    if(tasklet_ID == NR_TASKLETS - 1 && mcu_num[0] % NR_TASKLETS != 0)
         end_mcu += mcu_num[0] % NR_TASKLETS;
-    int start_row = start_mcu / metadata.mcu_width_real;
-    int start_column = start_mcu % metadata.mcu_width_real;
-    int end_row = end_mcu / metadata.mcu_width_real;
-    int end_column = end_mcu % metadata.mcu_width_real;
 
-    for(uint x=start_column; x<metadata.mcu_width_real; x+=metadata.horizontal_sampling_factor){
-        for(uint i=0; i<metadata.num_components; i++){
-            for(uint v=0; v<metadata.color_components[i].vertical_sampling_factor; v++){
-                for(uint h=0; h<metadata.color_components[i].horizontal_sampling_factor; h++){
-                    load_mcu(tasklet_ID, (start_row + v) * metadata.mcu_width_real + (x + h));
+    for(int mcu_index=start_mcu; mcu_index<end_mcu; mcu_index++) {
+        int row = mcu_index / metadata.mcu_width_real;
+        int column = mcu_index % metadata.mcu_width_real;
+        
+        for (uint i=0; i<metadata.num_components; i++) {
+            for (uint v=0; v<metadata.color_components[i].vertical_sampling_factor; v++) {
+                for (uint h=0; h<metadata.color_components[i].horizontal_sampling_factor; h++) {
+                    int current_mcu_index = (row + v) * metadata.mcu_width_real + (column + h);
+                    load_mcu(tasklet_ID, current_mcu_index);
                     idct_component_shift_and_add(tasklet_ID, i);
-                    store_mcu(tasklet_ID, (start_row + v) * metadata.mcu_width_real + (x + h));
-                }
-            }
-        }
-    }
-
-    for(uint y=start_row+1; y<=end_row-1; y+=metadata.vertical_sampling_factor){
-        for(uint x=0; x<metadata.mcu_width_real; x+=metadata.horizontal_sampling_factor){
-            for(uint i=0; i<metadata.num_components; i++){
-                for(uint v=0; v<metadata.color_components[i].vertical_sampling_factor; v++){
-                    for(uint h=0; h<metadata.color_components[i].horizontal_sampling_factor; h++){
-                        load_mcu(tasklet_ID, (y + v) * metadata.mcu_width_real + (x + h));
-                        idct_component_shift_and_add(tasklet_ID, i);
-                        store_mcu(tasklet_ID, (y + v) * metadata.mcu_width_real + (x + h));
-                    }
-                }
-            }
-        }
-    }
-
-    for(uint x=0; x<end_column+1; x+=metadata.horizontal_sampling_factor){
-        for(uint i=0; i<metadata.num_components; i++){
-            for(uint v=0; v<metadata.color_components[i].vertical_sampling_factor; v++){
-                for(uint h=0; h<metadata.color_components[i].horizontal_sampling_factor; h++){
-                    load_mcu(tasklet_ID, (end_row + v) * metadata.mcu_width_real + (x + h));
-                    idct_component_shift_and_add(tasklet_ID, i);
-                    store_mcu(tasklet_ID, (end_row + v) * metadata.mcu_width_real + (x + h));
+                    store_mcu(tasklet_ID, current_mcu_index);
                 }
             }
         }
