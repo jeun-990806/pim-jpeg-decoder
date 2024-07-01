@@ -64,12 +64,12 @@ int main(int argc, char *argv[]){
         inverseDCT(header, mcusFromHost);
         YCbCrToRGB(header, mcusFromHost);
 
-
         // Offloading to DPUs
         try{
             int mcuLinesPerDPU = header->mcuHeightReal;
             for(; mcuLinesPerDPU*header->mcuWidthReal>MAX_MCU_PER_DPU; mcuLinesPerDPU--);
             int dpuNums = header->mcuHeightReal / mcuLinesPerDPU;
+            if(header->mcuHeightReal % mcuLinesPerDPU != 0) dpuNums += 1;
             int mcuPerDPU = mcuLinesPerDPU * header->mcuWidthReal;
             auto system = DpuSet::allocate(dpuNums);
             std::cout << dpuNums << " DPUs are allocated.\n";
@@ -110,7 +110,7 @@ int main(int argc, char *argv[]){
 
             system.load(DPU_BINARY);
             for(uint i=0; i<dpuNums; i++){
-                for(int j=mcuPerDPU*i; j<mcuPerDPU*i+mcuPerDPU; j++){
+                for(int j=mcuPerDPU*i; j<mcuPerDPU*i+mcuPerDPU && j<header->mcuWidthReal*header->mcuHeightReal; j++){
                     for(uint k=0; k<64; k++){
                         component01[(j-mcuPerDPU*i) * 64 + k] = mcusFromDPU[j][0][k];
                         component02[(j-mcuPerDPU*i) * 64 + k] = mcusFromDPU[j][1][k];
@@ -158,7 +158,7 @@ int main(int argc, char *argv[]){
                 dpu->copy(y_r, "component01");
                 dpu->copy(cb_g, "component02");
                 dpu->copy(cr_b, "component03");
-                for(int j=mcuPerDPU*i; j<mcuPerDPU*i+mcuPerDPU; j++){
+                for(int j=mcuPerDPU*i; j<mcuPerDPU*i+mcuPerDPU && j<header->mcuWidthReal*header->mcuHeightReal; j++){
                     for(int k=0; k<64; k++){
                         mcusFromDPU[j][0][k] = y_r[0][(j - mcuPerDPU*i) * 64 + k];
                         mcusFromDPU[j][1][k] = cb_g[0][(j - mcuPerDPU*i) * 64 + k];

@@ -1,5 +1,4 @@
-NUM_TASKLETS := 2
-
+NUM_TASKLETS := 11
 all:
 	@mkdir bin -p
 	g++ --std=c++11 -o bin/decoder src/decoder.cpp `dpu-pkg-config --cflags --libs dpu` -g
