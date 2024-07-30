@@ -2,6 +2,7 @@
 #include <iomanip>
 #include <fstream>
 #include <cmath>
+#include <chrono>
 #include <dpu>
 
 #include "jpg.h"
@@ -44,7 +45,10 @@ int main(int argc, char *argv[]){
 
     for(int i=1; i<argc; i++){
         const std::string filename(argv[i]);
+        auto metadata_parsing_start = std::chrono::high_resolution_clock::now();
         Header *header = readJPG(filename);
+        auto metadata_parsing_end = std::chrono::high_resolution_clock::now();
+
         if(header == nullptr){
             continue;
         }
@@ -54,7 +58,9 @@ int main(int argc, char *argv[]){
             continue;
         }
 
+        auto huffman_decoding_start = std::chrono::high_resolution_clock::now();
         MCU *mcusFromHost = decodeHuffmanData(header);
+        auto huffman_decoding_end = std::chrono::high_resolution_clock::now();
         MCU *mcusFromDPU = decodeHuffmanData(header);
         if(mcusFromHost == nullptr){
             delete header;
@@ -65,12 +71,12 @@ int main(int argc, char *argv[]){
         YCbCrToRGB(header, mcusFromHost);
 
         // Offloading to DPUs
+        auto dpu_offloading_start = std::chrono::high_resolution_clock::now();
         try{
-            int mcuLinesPerDPU = header->mcuHeightReal;
-            for(; mcuLinesPerDPU*header->mcuWidthReal>MAX_MCU_PER_DPU; mcuLinesPerDPU--);
-            int dpuNums = header->mcuHeightReal / mcuLinesPerDPU;
-            if(header->mcuHeightReal % mcuLinesPerDPU != 0) dpuNums += 1;
-            int mcuPerDPU = mcuLinesPerDPU * header->mcuWidthReal;
+            int dpuNums = header->mcuHeightReal * header->mcuWidthReal / MAX_MCU_PER_DPU;
+            if(header->mcuHeightReal * header->mcuWidthReal % MAX_MCU_PER_DPU != 0) dpuNums += 1;
+            std::cout << dpuNums << " DPUs are allocated.\n";
+            int mcuPerDPU = header->mcuHeightReal * header->mcuWidthReal / dpuNums;
             auto system = DpuSet::allocate(dpuNums);
             std::cout << dpuNums << " DPUs are allocated.\n";
             std::cout << mcuPerDPU << " MCUs per DPU\n";
@@ -109,6 +115,7 @@ int main(int argc, char *argv[]){
             std::cout << "Total MCUs " << (header->mcuHeightReal * header->mcuWidthReal) << "\n";
 
             system.load(DPU_BINARY);
+            auto cpu_to_dpu_transfer_start = std::chrono::high_resolution_clock::now();
             for(uint i=0; i<dpuNums; i++){
                 for(int j=mcuPerDPU*i; j<mcuPerDPU*i+mcuPerDPU && j<header->mcuWidthReal*header->mcuHeightReal; j++){
                     for(uint k=0; k<64; k++){
@@ -125,7 +132,11 @@ int main(int argc, char *argv[]){
                 dpu->copy("mcu_num", mcuNum, sizeof(uint32_t) * 4);
                 dpu->copy("metadata_buffer", metaDataBuffer, sizeof(uint32_t) * 16);
             }
+            auto cpu_to_dpu_transfer_end = std::chrono::high_resolution_clock::now();
+
+            auto dpu_execution_start = std::chrono::high_resolution_clock::now();
             system.exec();
+            auto dpu_execution_end = std::chrono::high_resolution_clock::now();
             
             std::vector<std::vector<uint32_t>> initialization(1);
             initialization.front().resize(1);
@@ -153,6 +164,7 @@ int main(int argc, char *argv[]){
             std::vector<std::vector<short>> y_r(1, std::vector<short>(64 * mcuPerDPU, 0));
             std::vector<std::vector<short>> cb_g(1, std::vector<short>(64 * mcuPerDPU, 0));
             std::vector<std::vector<short>> cr_b(1, std::vector<short>(64 * mcuPerDPU, 0));
+            auto dpu_to_cpu_transfer_start = std::chrono::high_resolution_clock::now();
             for(uint i=0; i<dpuNums; i++){
                 dpu = system.dpus()[i];
                 dpu->copy(y_r, "component01");
@@ -166,15 +178,40 @@ int main(int argc, char *argv[]){
                     }
                 }
             }
-            system.log(std::cout);
+            auto dpu_to_cpu_transfer_end = std::chrono::high_resolution_clock::now();
+
+            std::chrono::duration<double> metadata_parsing_time = metadata_parsing_end - metadata_parsing_start;
+            std::chrono::duration<double> huffman_decoding_time = huffman_decoding_end - huffman_decoding_start;
+            std::chrono::duration<double> cpu_to_dpu_transfer_time = cpu_to_dpu_transfer_end - cpu_to_dpu_transfer_start;
+            std::chrono::duration<double> dpu_execution_time = dpu_execution_end - dpu_execution_start;
+            std::chrono::duration<double> dpu_to_cpu_transfer_time = dpu_to_cpu_transfer_end - dpu_to_cpu_transfer_start;
+
+            std::cout << "Host Profile ================================\n";
+            std::cout << "Metadata parsing time:\t\t" << metadata_parsing_time.count() << "s\n";
+            std::cout << "Huffman decoding time:\t\t" << huffman_decoding_time.count() << "s\n";
+            std::cout << "CPU-to-DPU transfer time:\t" << cpu_to_dpu_transfer_time.count() << "s\n";
+            std::cout << "DPU execution time:\t\t" << dpu_execution_time.count() << "s\n";
+            std::cout << "DPU-to-CPU transfer time:\t" << dpu_to_cpu_transfer_time.count() << "s\n";
+
+            // system.log(std::cout);
         }catch(const DpuError & e){
                 std::cerr << e.what() << "\n";
         }
+        auto dpu_offloading_end = std::chrono::high_resolution_clock::now();
+
+        std::chrono::duration<double> dpu_offloading_time = dpu_offloading_end - dpu_offloading_start;
+        std::cout << " > DPU offloading time:\t\t" << dpu_offloading_time.count() << "s\n";
 
         // write BMP file
         const std::size_t pos = filename.find_last_of('.');
+        auto file_writing_start = std::chrono::high_resolution_clock::now();
         writeBMP(header, mcusFromHost, (pos == std::string::npos) ? (filename + "_host.bmp") : (filename.substr(0, pos) + "_host.bmp"));
+        auto file_writing_end = std::chrono::high_resolution_clock::now();
         writeBMP(header, mcusFromDPU, (pos == std::string::npos) ? (filename + "_dpu.bmp") : (filename.substr(0, pos) + "_dpu.bmp"));
+
+        std::chrono::duration<double> file_writing_time = file_writing_end - file_writing_start;
+
+        std::cout << "File writing time:\t\t" << file_writing_time.count() << "s\n";
 
         delete[] mcusFromHost;
         delete[] mcusFromDPU;
