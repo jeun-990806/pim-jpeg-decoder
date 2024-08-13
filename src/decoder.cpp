@@ -1,8 +1,15 @@
 #include <iostream>
 #include <iomanip>
 #include <fstream>
+
+#include <thread>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+
 #include <cmath>
 #include <chrono>
+
 #include <dpu>
 
 #include "jpg.h"
@@ -29,13 +36,193 @@ void generateCodes(HuffmanTable& hTable);
 byte getNextSymbol(BitReader& b, const HuffmanTable& hTable);
 bool decodeMCUComponent(BitReader& b, int *const component, int& previousDC, const HuffmanTable& dcTable, const HuffmanTable& acTable);
 MCU *decodeHuffmanData(Header *const header);
-void dequantize(const Header *const header, MCU *const mcus);
-void inverseDCTComponent(const float *const idctMap, int *const component);
-void inverseDCT(const Header *const header, MCU *const mcus);
-void YCbCrToRGB(const Header *const header, MCU *const mcus);
 
 void printHeader(const Header *const header);
 void writeBMP(const Header *const header, const MCU *const mcus, const std::string& filename);
+
+std::queue<JPEG> JPEG_queue;
+std::mutex mtx;
+std::condition_variable cv;
+bool finished = false;
+
+auto pim = DpuSet::allocate(DPU_ALLOCATE_ALL);
+uint nr_dpus = pim.dpus().size();
+
+int max_mcu_buffer_size = nr_dpus * MAX_MCU_PER_DPU;
+
+int get_mcus_in_queue(){
+    int total_mcus = 0;
+    std::queue<JPEG> temp_queue = JPEG_queue;
+    while(!temp_queue.empty()){
+        total_mcus += temp_queue.front().header->mcuWidthReal * temp_queue.front().header->mcuHeightReal;
+        temp_queue.pop();
+    }
+    return total_mcus;
+}
+
+void mcu_prepare(const std::vector<std::string>& input_files){
+    for(const auto& filename : input_files){
+        JPEG file;
+
+        Header *header = readJPG(filename);
+        if(header == nullptr || header->valid == false){
+            std::cout << filename << ": Error - Invalid JPEG\n";
+        }else{
+            std::cout << filename << ": Loaded\n";
+        }
+
+        if(get_mcus_in_queue() >= max_mcu_buffer_size || JPEG_queue.size() >= nr_dpus) cv.notify_one();
+
+        MCU *mcus = decodeHuffmanData(header);
+        if(mcus == nullptr){
+            std::cout << filename << ": Error - Huffman Decoding\n";
+            continue;
+        }
+
+        file.filename = filename;
+        file.header = header;
+        file.mcus = mcus;
+        
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            JPEG_queue.push(file);
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        finished = true;
+    }
+    cv.notify_one();
+}
+
+void offloading(){
+    while(true){
+        std::unique_lock<std::mutex> lock(mtx);
+
+        cv.wait(lock, [] { return get_mcus_in_queue() >= max_mcu_buffer_size || JPEG_queue.size() >= nr_dpus || finished; });
+
+        if(!JPEG_queue.empty()){
+            std::vector<JPEG> JPEG_batch;
+            std::vector<int> allocated_dpus_info;
+            std::vector<int> mcus_per_dpu_info;
+            int mcus_in_batch = 0;
+
+            std::cout << "Batch =============================\n";
+            while(!JPEG_queue.empty()){
+                JPEG file = JPEG_queue.front();
+                JPEG_batch.push_back(file);
+                mcus_in_batch += file.header->mcuWidthReal * file.header->mcuHeightReal;
+                JPEG_queue.pop();
+            }
+        
+            lock.unlock();
+            pim.load(DPU_BINARY);
+            uint free_dpus = nr_dpus;
+            int mcus_at_once = mcus_in_batch / nr_dpus;
+            int start_dpu_num = 0;
+
+            for(const auto& file : JPEG_batch){
+                int allocated_dpus = std::min(file.header->mcuWidthReal * file.header->mcuHeightReal / mcus_at_once, free_dpus);
+                if(allocated_dpus <= 1) allocated_dpus = 1;
+                else allocated_dpus -= 1;
+                int mcus_per_dpu = (file.header->mcuWidthReal * file.header->mcuHeightReal) / allocated_dpus;
+                if((file.header->mcuWidthReal * file.header->mcuHeightReal) % allocated_dpus != 0) allocated_dpus += 1;
+
+                std::cout << file.filename << ": Use " << allocated_dpus << " dpus (" << mcus_per_dpu << " MCUs per DPU)\n";
+                allocated_dpus_info.push_back(allocated_dpus);
+                free_dpus -= allocated_dpus;
+                mcus_per_dpu_info.push_back(mcus_per_dpu);
+
+                std::vector<uint32_t> mcu_num(4);
+                mcu_num[0] = mcus_per_dpu;
+                    
+                std::vector<uint32_t> metadata_buffer(16);
+                metadata_buffer[0] = file.header->mcuHeight;
+                metadata_buffer[1] = file.header->mcuWidth;
+                metadata_buffer[2] = file.header->mcuHeightReal;
+                metadata_buffer[3] = file.header->mcuWidthReal;
+                metadata_buffer[4] = file.header->numComponents;
+                metadata_buffer[5] = file.header->verticalSamplingFactor;
+                metadata_buffer[6] = file.header->horizontalSamplingFactor;
+                for(uint j=0; j<file.header->numComponents; j++)
+                    metadata_buffer[j + 7] = file.header->colorComponents[j].quantizationTableID;
+                for(uint j=0; j<file.header->numComponents; j++)
+                    metadata_buffer[j + file.header->numComponents + 7] = file.header->colorComponents[j].horizontalSamplingFactor;
+                for(uint j=0; j<file.header->numComponents; j++)
+                    metadata_buffer[j + (file.header->numComponents * 2) + 7] = file.header->colorComponents[j].verticalSamplingFactor;
+
+                std::vector<uint32_t> quantization_tables(4 * 64);
+                for(uint j=0; j<4; j++){
+                    if(!file.header->quantizationTables[j].set) break;
+                    for(uint k=0; k<64; k++){
+                        quantization_tables[j * 64 + k] = file.header->quantizationTables[j].table[k];
+                    }
+                }
+
+                std::vector<short> component01(64 * mcus_per_dpu);
+                std::vector<short> component02(64 * mcus_per_dpu);
+                std::vector<short> component03(64 * mcus_per_dpu);
+
+                for(uint j=0; j<allocated_dpus; j++){
+                    for(int k=mcus_per_dpu*j; k<mcus_per_dpu*(j+1) && k<file.header->mcuWidthReal*file.header->mcuHeightReal; k++){
+                        for(uint l=0; l<64; l++){
+                            component01[(k-mcus_per_dpu*j) * 64 + l] = file.mcus[k][0][l];
+                            component02[(k-mcus_per_dpu*j) * 64 + l] = file.mcus[k][1][l];
+                            component03[(k-mcus_per_dpu*j) * 64 + l] = file.mcus[k][2][l];
+                        }
+                    }
+                    auto dpu = pim.dpus()[j + start_dpu_num];
+                    dpu->copy("quantization_tables", quantization_tables, sizeof(uint32_t) * 4 * 64);
+                    dpu->copy("component01", component01, sizeof(short) * 64 * mcus_per_dpu);
+                    dpu->copy("component02", component02, sizeof(short) * 64 * mcus_per_dpu);
+                    dpu->copy("component03", component03, sizeof(short) * 64 * mcus_per_dpu);
+                    dpu->copy("mcu_num", mcu_num, sizeof(uint32_t) * 4);
+                    dpu->copy("metadata_buffer", metadata_buffer, sizeof(uint32_t) * 16);
+                }
+
+                start_dpu_num += allocated_dpus;
+            
+            }
+
+            pim.exec();
+
+            std::cout << "Decoded ===========================\n";
+            start_dpu_num = 0;
+            for(const auto& file : JPEG_batch){
+                int allocated_dpus = allocated_dpus_info.front();
+                int mcus_per_dpu = mcus_per_dpu_info.front();
+                allocated_dpus_info.erase(allocated_dpus_info.begin());
+                mcus_per_dpu_info.erase(mcus_per_dpu_info.begin());
+
+                std::vector<std::vector<short>> y_r(1, std::vector<short>(64 * mcus_per_dpu, 0));
+                std::vector<std::vector<short>> cb_g(1, std::vector<short>(64 * mcus_per_dpu, 0));
+                std::vector<std::vector<short>> cr_b(1, std::vector<short>(64 * mcus_per_dpu, 0));
+                for(uint j=0; j<allocated_dpus; j++){
+                    auto dpu = pim.dpus()[j + start_dpu_num];
+                    dpu->copy(y_r, "component01");
+                    dpu->copy(cb_g, "component02");
+                    dpu->copy(cr_b, "component03");
+                    for(int k=mcus_per_dpu*j; k<mcus_per_dpu*(j+1) && k<file.header->mcuWidthReal * file.header->mcuHeightReal; k++){
+                        for(int l=0; l<64; l++){
+                            file.mcus[k][0][l] = y_r[0][(k-mcus_per_dpu*j) * 64 + l];
+                            file.mcus[k][1][l] = cb_g[0][(k-mcus_per_dpu*j) * 64 + l];
+                            file.mcus[k][2][l] = cr_b[0][(k-mcus_per_dpu*j) * 64 + l];
+                        }
+                    }
+                }
+
+                const std::size_t pos = file.filename.find_last_of('.');
+                writeBMP(file.header, file.mcus, (pos == std::string::npos) ? (file.filename + ".bmp") : (file.filename.substr(0, pos) + ".bmp"));
+
+                std::cout << file.filename << ": Saved (" << (file.filename.substr(0, pos) + ".bmp") << ")\n";
+                start_dpu_num += allocated_dpus;
+            }
+            std::cout << "===================================\n";
+
+        }else if(finished) break;
+    }
+}
 
 int main(int argc, char *argv[]){
     if(argc < 2){
@@ -43,180 +230,24 @@ int main(int argc, char *argv[]){
         return 1;
     }
 
-    for(int i=1; i<argc; i++){
-        const std::string filename(argv[i]);
-        auto metadata_parsing_start = std::chrono::high_resolution_clock::now();
-        Header *header = readJPG(filename);
-        auto metadata_parsing_end = std::chrono::high_resolution_clock::now();
+    std::vector<std::string> input_files;
+    for(int i=1; i<argc; i++) input_files.push_back(argv[i]);
+    
+    std::cout << nr_dpus << " dpus are allocated\n";
+    int max_mcu_window = nr_dpus * MAX_MCU_PER_DPU;
 
-        if(header == nullptr){
-            continue;
-        }
-        if(header->valid == false){
-            std::cout << "Error - Invalid JPG\n";
-            delete header;
-            continue;
-        }
+    auto start = std::chrono::high_resolution_clock::now();
 
-        auto huffman_decoding_start = std::chrono::high_resolution_clock::now();
-        MCU *mcusFromHost = decodeHuffmanData(header);
-        auto huffman_decoding_end = std::chrono::high_resolution_clock::now();
-        MCU *mcusFromDPU = decodeHuffmanData(header);
-        if(mcusFromHost == nullptr){
-            delete header;
-            continue;
-        }
-        dequantize(header, mcusFromHost);
-        inverseDCT(header, mcusFromHost);
-        YCbCrToRGB(header, mcusFromHost);
+    std::thread mcu_preparer(mcu_prepare, std::ref(input_files));
+    std::thread decoding_offloader(offloading);
 
-        // Offloading to DPUs
-        auto dpu_offloading_start = std::chrono::high_resolution_clock::now();
-        try{
-            int dpuNums = header->mcuHeightReal * header->mcuWidthReal / MAX_MCU_PER_DPU;
-            if(header->mcuHeightReal * header->mcuWidthReal % MAX_MCU_PER_DPU != 0) dpuNums += 1;
-            std::cout << dpuNums << " DPUs are allocated.\n";
-            int mcuPerDPU = header->mcuHeightReal * header->mcuWidthReal / dpuNums;
-            auto system = DpuSet::allocate(dpuNums);
-            std::cout << dpuNums << " DPUs are allocated.\n";
-            std::cout << mcuPerDPU << " MCUs per DPU\n";
+    mcu_preparer.join();
+    decoding_offloader.join();
 
-            std::vector<uint32_t> mcuNum(4);
-            mcuNum[0] = mcuPerDPU;
+    auto end = std::chrono::high_resolution_clock::now();
 
-            std::vector<uint32_t> metaDataBuffer(16);
-            metaDataBuffer[0] = header->mcuHeight;
-            metaDataBuffer[1] = header->mcuWidth;
-            metaDataBuffer[2] = header->mcuHeightReal;
-            metaDataBuffer[3] = header->mcuWidthReal;
-            metaDataBuffer[4] = header->numComponents;
-            metaDataBuffer[5] = header->verticalSamplingFactor;
-            metaDataBuffer[6] = header->horizontalSamplingFactor;
-            for(uint i=0; i<header->numComponents; i++)
-                metaDataBuffer[i + 7] = header->colorComponents[i].quantizationTableID;
-            for(uint i=0; i<header->numComponents; i++)
-                metaDataBuffer[i + header->numComponents + 7] = header->colorComponents[i].horizontalSamplingFactor;
-            for(uint i=0; i<header->numComponents; i++)
-                metaDataBuffer[i + (header->numComponents * 2) + 7] = header->colorComponents[i].verticalSamplingFactor;
-            std::cout << "Metadata buffer is prepared\n";
-
-            std::vector<uint32_t> quantizationTables(4 * 64);
-            for(uint i=0; i<4; i++){
-                if(!header->quantizationTables[i].set) break;
-                for(uint j=0; j<64; j++){
-                    quantizationTables[i * 64 + j] = header->quantizationTables[i].table[j];
-                }
-            }
-            std::cout << "Quantization tables are prepared\n";
-
-            std::vector<short> component01(64 * mcuPerDPU);
-            std::vector<short> component02(64 * mcuPerDPU);
-            std::vector<short> component03(64 * mcuPerDPU);
-            std::cout << "Total MCUs " << (header->mcuHeightReal * header->mcuWidthReal) << "\n";
-
-            system.load(DPU_BINARY);
-            auto cpu_to_dpu_transfer_start = std::chrono::high_resolution_clock::now();
-            for(uint i=0; i<dpuNums; i++){
-                for(int j=mcuPerDPU*i; j<mcuPerDPU*i+mcuPerDPU && j<header->mcuWidthReal*header->mcuHeightReal; j++){
-                    for(uint k=0; k<64; k++){
-                        component01[(j-mcuPerDPU*i) * 64 + k] = mcusFromDPU[j][0][k];
-                        component02[(j-mcuPerDPU*i) * 64 + k] = mcusFromDPU[j][1][k];
-                        component03[(j-mcuPerDPU*i) * 64 + k] = mcusFromDPU[j][2][k];
-                    }
-                }
-                auto dpu = system.dpus()[i];
-                dpu->copy("quantization_tables", quantizationTables, sizeof(uint32_t) * 4 * 64);
-                dpu->copy("component01", component01, sizeof(short) * 64 * mcuPerDPU);
-                dpu->copy("component02", component02, sizeof(short) * 64 * mcuPerDPU);
-                dpu->copy("component03", component03, sizeof(short) * 64 * mcuPerDPU);
-                dpu->copy("mcu_num", mcuNum, sizeof(uint32_t) * 4);
-                dpu->copy("metadata_buffer", metaDataBuffer, sizeof(uint32_t) * 16);
-            }
-            auto cpu_to_dpu_transfer_end = std::chrono::high_resolution_clock::now();
-
-            auto dpu_execution_start = std::chrono::high_resolution_clock::now();
-            system.exec();
-            auto dpu_execution_end = std::chrono::high_resolution_clock::now();
-            
-            std::vector<std::vector<uint32_t>> initialization(1);
-            initialization.front().resize(1);
-            std::vector<std::vector<uint32_t>> dequantization(1);
-            dequantization.front().resize(1);
-            std::vector<std::vector<uint32_t>> inverse_dct(1);
-            inverse_dct.front().resize(1);
-            std::vector<std::vector<uint32_t>> color_space_conversion(1);
-            color_space_conversion.front().resize(1);
-            std::vector<std::vector<uint32_t>> clocks_per_sec(1);
-            clocks_per_sec.front().resize(1);
-
-            auto dpu = system.dpus()[0];
-            dpu->copy(clocks_per_sec, "CLOCKS_PER_SEC");
-            dpu->copy(initialization, "initialization");
-            dpu->copy(dequantization, "dequantization");
-            dpu->copy(inverse_dct, "inverse_dct");
-            dpu->copy(color_space_conversion, "color_space_conversion");
-            std::cout << "Initialization: " << (float)initialization.front().front() / clocks_per_sec.front().front() << "s (" << initialization.front().front() << " cycles)\n";
-            std::cout << "Dequantization: " << (float)dequantization.front().front() / clocks_per_sec.front().front() << "s (" << dequantization.front().front() << " cycles)\n";
-            std::cout << "Inverse DCT: " << (float)inverse_dct.front().front() / clocks_per_sec.front().front() << "s (" << inverse_dct.front().front() << " cycles)\n";
-            std::cout << "Color Space Conversion: " << (float)color_space_conversion.front().front() / clocks_per_sec.front().front() << "s (" << color_space_conversion.front().front() << " cycles)\n";
-            
-            // Load decoded data
-            std::vector<std::vector<short>> y_r(1, std::vector<short>(64 * mcuPerDPU, 0));
-            std::vector<std::vector<short>> cb_g(1, std::vector<short>(64 * mcuPerDPU, 0));
-            std::vector<std::vector<short>> cr_b(1, std::vector<short>(64 * mcuPerDPU, 0));
-            auto dpu_to_cpu_transfer_start = std::chrono::high_resolution_clock::now();
-            for(uint i=0; i<dpuNums; i++){
-                dpu = system.dpus()[i];
-                dpu->copy(y_r, "component01");
-                dpu->copy(cb_g, "component02");
-                dpu->copy(cr_b, "component03");
-                for(int j=mcuPerDPU*i; j<mcuPerDPU*i+mcuPerDPU && j<header->mcuWidthReal*header->mcuHeightReal; j++){
-                    for(int k=0; k<64; k++){
-                        mcusFromDPU[j][0][k] = y_r[0][(j - mcuPerDPU*i) * 64 + k];
-                        mcusFromDPU[j][1][k] = cb_g[0][(j - mcuPerDPU*i) * 64 + k];
-                        mcusFromDPU[j][2][k] = cr_b[0][(j - mcuPerDPU*i) * 64 + k];
-                    }
-                }
-            }
-            auto dpu_to_cpu_transfer_end = std::chrono::high_resolution_clock::now();
-
-            std::chrono::duration<double> metadata_parsing_time = metadata_parsing_end - metadata_parsing_start;
-            std::chrono::duration<double> huffman_decoding_time = huffman_decoding_end - huffman_decoding_start;
-            std::chrono::duration<double> cpu_to_dpu_transfer_time = cpu_to_dpu_transfer_end - cpu_to_dpu_transfer_start;
-            std::chrono::duration<double> dpu_execution_time = dpu_execution_end - dpu_execution_start;
-            std::chrono::duration<double> dpu_to_cpu_transfer_time = dpu_to_cpu_transfer_end - dpu_to_cpu_transfer_start;
-
-            std::cout << "Host Profile ================================\n";
-            std::cout << "Metadata parsing time:\t\t" << metadata_parsing_time.count() << "s\n";
-            std::cout << "Huffman decoding time:\t\t" << huffman_decoding_time.count() << "s\n";
-            std::cout << "CPU-to-DPU transfer time:\t" << cpu_to_dpu_transfer_time.count() << "s\n";
-            std::cout << "DPU execution time:\t\t" << dpu_execution_time.count() << "s\n";
-            std::cout << "DPU-to-CPU transfer time:\t" << dpu_to_cpu_transfer_time.count() << "s\n";
-
-            // system.log(std::cout);
-        }catch(const DpuError & e){
-                std::cerr << e.what() << "\n";
-        }
-        auto dpu_offloading_end = std::chrono::high_resolution_clock::now();
-
-        std::chrono::duration<double> dpu_offloading_time = dpu_offloading_end - dpu_offloading_start;
-        std::cout << " > DPU offloading time:\t\t" << dpu_offloading_time.count() << "s\n";
-
-        // write BMP file
-        const std::size_t pos = filename.find_last_of('.');
-        auto file_writing_start = std::chrono::high_resolution_clock::now();
-        writeBMP(header, mcusFromHost, (pos == std::string::npos) ? (filename + "_host.bmp") : (filename.substr(0, pos) + "_host.bmp"));
-        auto file_writing_end = std::chrono::high_resolution_clock::now();
-        writeBMP(header, mcusFromDPU, (pos == std::string::npos) ? (filename + "_dpu.bmp") : (filename.substr(0, pos) + "_dpu.bmp"));
-
-        std::chrono::duration<double> file_writing_time = file_writing_end - file_writing_start;
-
-        std::cout << "File writing time:\t\t" << file_writing_time.count() << "s\n";
-
-        delete[] mcusFromHost;
-        delete[] mcusFromDPU;
-        delete header;
-    }
+    std::chrono::duration<double> execution_time = end - start;
+    std::cout << "\nEnd-to-end execution time: " << execution_time.count() << "s\n";
 
     return 0;
 }
@@ -234,7 +265,6 @@ void putShort(std::ofstream &outFile, const uint v){
 }
 
 void readStartOfScan(std::ifstream& inFile, Header *const header){
-    std::cout << "Reading SOS Marker\n";
     if(header->numComponents == 0){
         std::cout << "Error - SOS detected before SOF\n";
         header->valid = false;
@@ -368,7 +398,6 @@ void readStartOfScan(std::ifstream& inFile, Header *const header){
 }
 
 void readHuffmanTable(std::ifstream& inFile, Header *const header){
-    std::cout << "Reading DHT Marker\n";
     int length = (inFile.get() << 8) + inFile.get();
     length -= 2;
 
@@ -416,7 +445,6 @@ void readHuffmanTable(std::ifstream& inFile, Header *const header){
 }
 
 void readStartOfFrame(std::ifstream& inFile, Header *const header){
-    std::cout << "Reading SOF Marker\n";
     if(header->numComponents != 0){
         std::cout << "Error - Multiple SOFs detected\n";
         header->valid = false;
@@ -501,8 +529,6 @@ void readStartOfFrame(std::ifstream& inFile, Header *const header){
                 return;
             }
         }
-
-        std::cout << "vertical sampling factor: " << (uint)header->verticalSamplingFactor << ", horizontal sampling factor: " << (uint)header->horizontalSamplingFactor << "\n";
         
         component->quantizationTableID = inFile.get();
         if(component->quantizationTableID > 3){
@@ -519,7 +545,6 @@ void readStartOfFrame(std::ifstream& inFile, Header *const header){
 }
 
 void readQuantizationTable(std::ifstream& inFile, Header *const header){
-    std::cout << "Reading DQT Marker\n";
     int length = (inFile.get() << 8) + inFile.get();
     length -= 2;
 
@@ -556,7 +581,6 @@ void readQuantizationTable(std::ifstream& inFile, Header *const header){
 }
 
 void readRestartInterval(std::ifstream& inFile, Header *const header){
-    std::cout << "Reading DRI Marker\n";
     uint length = (inFile.get() << 8) + inFile.get();
 
     header->restartInterval = (inFile.get() << 8) + inFile.get();
@@ -567,14 +591,12 @@ void readRestartInterval(std::ifstream& inFile, Header *const header){
 }
 
 void readAPPN(std::ifstream& inFile, Header *const header){
-    std::cout << "Reading APPN Marker\n";
     uint length = (inFile.get() << 8) + inFile.get();
 
     for(uint i=0; i<length-2; ++i) inFile.get();
 }
 
 void readComment(std::ifstream& inFile, Header *const header){
-    std::cout << "Reading COM Marker\n";
     uint length = (inFile.get() << 8) + inFile.get();
 
     for(uint i=0; i<length-2; i++){
@@ -820,103 +842,6 @@ MCU *decodeHuffmanData(Header *const header){
     }
 
     return mcus;
-}
-
-void dequantize(const Header *const header, MCU *const mcus){
-  for(uint y=0; y<header->mcuHeight; y += header->verticalSamplingFactor){
-    for(uint x=0; x<header->mcuWidth; x += header->horizontalSamplingFactor){
-      for(uint i=0; i<header->numComponents; i++){
-        for(uint v=0; v<header->colorComponents[i].verticalSamplingFactor; v++){
-          for(uint h=0; h<header->colorComponents[i].horizontalSamplingFactor; h++){
-            for(uint k=0; k<64; k++){
-                mcus[(y + v) * header->mcuWidthReal + (x + h)][i][k] *= header->quantizationTables[header->colorComponents[i].quantizationTableID].table[k];
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
-void inverseDCTComponent(const float *const idctMap, int *const component){
-    float result[64] = { 0 };
-    for(uint i=0; i<8; i++){
-        for(uint y=0; y<8; y++){
-            float sum = 0.0f;
-            for(uint v=0; v<8; v++){
-                sum += component[v * 8 + i] * idctMap[v * 8 + y];
-            }
-            result[y * 8 + i] = sum;
-        }
-    }
-
-    for(uint i=0; i<8; i++){
-        for(uint x=0; x<8; x++){
-            float sum = 0.0f;
-            for(uint u=0; u<8; u++){
-                sum += result[i * 8 + u] * idctMap[u * 8 + x];
-            }
-            component[i * 8 + x] = (int)sum;
-        }
-    }
-}
-
-void inverseDCT(const Header *const header, MCU *const mcus){
-    float idctMap[64];
-    for(uint u=0; u<8; u++){
-        const float c = (u == 0) ? (1.0 / std::sqrt(2.0) / 2.0) : (1.0 / 2.0);
-        for(uint x=0; x<8; x++){
-            idctMap[u * 8 + x] = c * std::cos((2.0 * x + 1.0) * u * M_PI / 16.0);
-        }
-    }
-
-    for(uint y=0; y<header->mcuHeight; y+=header->verticalSamplingFactor){
-      for(uint x=0; x<header->mcuWidth; x+=header->horizontalSamplingFactor){
-        for(uint i=0; i<header->numComponents; i++){
-          for(uint v=0; v<header->colorComponents[i].verticalSamplingFactor; v++){
-            for(uint h=0; h<header->colorComponents[i].horizontalSamplingFactor; h++){
-              inverseDCTComponent(idctMap, mcus[(y + v) * header->mcuWidthReal + (x + h)][i]);
-            }
-          }
-        }
-      }
-    }
-}
-
-void YCbCrToRGBMCU(const Header *const header, MCU& mcu, const MCU& cbcr, const uint v, const uint h){
-    for(uint y=7; y<8; y--){
-        for(uint x=7; x<8; x--){
-            const uint pixel = y * 8 + x;
-            const uint cbcrPixelRow = y / header->verticalSamplingFactor + 4 * v;
-            const uint cbcrPixelColumn = x / header->horizontalSamplingFactor + 4 * h;
-            const uint cbcrPixel = cbcrPixelRow * 8 + cbcrPixelColumn;
-            int r = mcu.y[pixel] + 1.402f * cbcr.cr[cbcrPixel] + 128;
-            int g = mcu.y[pixel] - 0.344f * cbcr.cb[cbcrPixel] - 0.714 * cbcr.cr[cbcrPixel] + 128;
-            int b = mcu.y[pixel] + 1.772f * cbcr.cb[cbcrPixel] + 128;
-            if(r < 0) r = 0;
-            if(r > 255) r = 255;
-            if(g < 0) g = 0;
-            if(g > 255) g = 255;
-            if(b < 0) b = 0;
-            if(b > 255) b = 255;
-            mcu.r[pixel] = r;
-            mcu.g[pixel] = g;
-            mcu.b[pixel] = b;
-        }
-    }
-}
-
-void YCbCrToRGB(const Header *const header, MCU *const mcus){
-    for(uint y=0; y<header->mcuHeight; y+=header->verticalSamplingFactor){
-        for(uint x=0; x<header->mcuWidth; x+=header->horizontalSamplingFactor){
-            const MCU& cbcr = mcus[y * header->mcuWidthReal + x];
-            for(uint v=header->verticalSamplingFactor-1; v<header->verticalSamplingFactor; v--){
-                for(uint h=header->horizontalSamplingFactor-1; h<header->horizontalSamplingFactor; h--){
-                    YCbCrToRGBMCU(header, mcus[(y + v) * header->mcuWidthReal + (x + h)], cbcr, v, h);
-                }
-            }
-        }
-    }
 }
 
 void writeBMP(const Header *const header, const MCU *const mcus, const std::string& filename){
