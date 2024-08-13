@@ -1,2 +1,4 @@
 bin/
+test_images/
+imagenet/
 *.bmp
