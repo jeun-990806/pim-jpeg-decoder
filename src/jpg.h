@@ -173,4 +173,10 @@ struct MCU {
     }
 };
 
+struct JPEG {
+    std::string filename;
+    Header *header;
+    MCU *mcus;
+};
+
 #endif
