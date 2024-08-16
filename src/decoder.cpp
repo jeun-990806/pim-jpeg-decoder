@@ -1,6 +1,8 @@
 #include <iostream>
 #include <iomanip>
 #include <fstream>
+#include <map>
+#include <algorithm>
 
 #include <thread>
 #include <queue>
@@ -50,6 +52,9 @@ uint nr_dpus = pim.dpus().size();
 
 int max_mcu_buffer_size = nr_dpus * MAX_MCU_PER_DPU;
 
+std::vector<std::map<std::string, std::chrono::duration<double>>> execution_times;
+std::chrono::duration<double> mcu_prepare_time;
+
 int get_mcus_in_queue(){
     int total_mcus = 0;
     std::queue<JPEG> temp_queue = JPEG_queue;
@@ -61,6 +66,9 @@ int get_mcus_in_queue(){
 }
 
 void mcu_prepare(const std::vector<std::string>& input_files){
+
+    auto mcu_prepare_start = std::chrono::high_resolution_clock::now();
+
     for(const auto& filename : input_files){
         JPEG file;
 
@@ -89,6 +97,9 @@ void mcu_prepare(const std::vector<std::string>& input_files){
         }
     }
 
+    auto mcu_prepare_end = std::chrono::high_resolution_clock::now();
+    mcu_prepare_time = mcu_prepare_end - mcu_prepare_start;
+
     {
         std::lock_guard<std::mutex> lock(mtx);
         finished = true;
@@ -98,9 +109,13 @@ void mcu_prepare(const std::vector<std::string>& input_files){
 
 void offloading(){
     while(true){
+        std::map<std::string, std::chrono::duration<double>> execution_time;
         std::unique_lock<std::mutex> lock(mtx);
 
+        auto wait_start = std::chrono::high_resolution_clock::now();
         cv.wait(lock, [] { return get_mcus_in_queue() >= max_mcu_buffer_size || JPEG_queue.size() >= nr_dpus || finished; });
+        auto wait_end = std::chrono::high_resolution_clock::now();
+        execution_time["wait_time"] = wait_end - wait_start;
 
         if(!JPEG_queue.empty()){
             std::vector<JPEG> JPEG_batch;
@@ -109,12 +124,15 @@ void offloading(){
             int mcus_in_batch = 0;
 
             std::cout << "Batch =============================\n";
+            auto batch_start = std::chrono::high_resolution_clock::now();
             while(!JPEG_queue.empty()){
                 JPEG file = JPEG_queue.front();
                 JPEG_batch.push_back(file);
                 mcus_in_batch += file.header->mcuWidthReal * file.header->mcuHeightReal;
                 JPEG_queue.pop();
             }
+            auto batch_end = std::chrono::high_resolution_clock::now();
+            execution_time["batch_time"] = batch_end - batch_start;
         
             lock.unlock();
             pim.load(DPU_BINARY);
@@ -122,6 +140,7 @@ void offloading(){
             int mcus_at_once = mcus_in_batch / nr_dpus;
             int start_dpu_num = 0;
 
+            auto cpu_to_dpus_start = std::chrono::high_resolution_clock::now();
             for(const auto& file : JPEG_batch){
                 int allocated_dpus = std::min(file.header->mcuWidthReal * file.header->mcuHeightReal / mcus_at_once, free_dpus);
                 if(allocated_dpus <= 1) allocated_dpus = 1;
@@ -184,11 +203,17 @@ void offloading(){
                 start_dpu_num += allocated_dpus;
             
             }
+            auto cpu_to_dpus_end = std::chrono::high_resolution_clock::now();
+            execution_time["cpu_to_dpus_time"] = cpu_to_dpus_end - cpu_to_dpus_start;
 
+            auto dpu_execution_start = std::chrono::high_resolution_clock::now();
             pim.exec();
+            auto dpu_execution_end = std::chrono::high_resolution_clock::now();
+            execution_time["dpu_execution_time"] = dpu_execution_end - dpu_execution_start;
 
             std::cout << "Decoded ===========================\n";
             start_dpu_num = 0;
+            auto dpus_to_cpu_start = std::chrono::high_resolution_clock::now();
             for(const auto& file : JPEG_batch){
                 int allocated_dpus = allocated_dpus_info.front();
                 int mcus_per_dpu = mcus_per_dpu_info.front();
@@ -211,17 +236,33 @@ void offloading(){
                         }
                     }
                 }
+                start_dpu_num += allocated_dpus;
+            }
+            auto dpus_to_cpu_end = std::chrono::high_resolution_clock::now();
+            execution_time["dpus_to_cpu_time"] = dpus_to_cpu_end - dpus_to_cpu_start;
 
+            auto bmp_write_start = std::chrono::high_resolution_clock::now();
+            for(const auto& file : JPEG_batch){
                 const std::size_t pos = file.filename.find_last_of('.');
                 writeBMP(file.header, file.mcus, (pos == std::string::npos) ? (file.filename + ".bmp") : (file.filename.substr(0, pos) + ".bmp"));
 
                 std::cout << file.filename << ": Saved (" << (file.filename.substr(0, pos) + ".bmp") << ")\n";
-                start_dpu_num += allocated_dpus;
             }
+            auto bmp_write_end = std::chrono::high_resolution_clock::now();
+            execution_time["bmp_write_time"] = bmp_write_end - bmp_write_start;
             std::cout << "===================================\n";
-
+            
+            execution_times.push_back(execution_time);
         }else if(finished) break;
     }
+}
+
+std::chrono::duration<double> sum_of_map(const std::map<std::string, std::chrono::duration<double>>& m) {
+    std::chrono::duration<double> sum = static_cast<std::chrono::duration<double>>(0);
+    for (const auto& pair : m) {
+        sum += pair.second;
+    }
+    return sum;
 }
 
 int main(int argc, char *argv[]){
@@ -246,8 +287,40 @@ int main(int argc, char *argv[]){
 
     auto end = std::chrono::high_resolution_clock::now();
 
+    auto compare = [](const std::map<std::string, std::chrono::duration<double>>& a, const std::map<std::string, std::chrono::duration<double>>& b) {
+        return sum_of_map(a) < sum_of_map(b);
+    };
+    std::sort(execution_times.begin(), execution_times.end(), compare);
+
+    std::cout << "\nProfiles:\n";
+
     std::chrono::duration<double> execution_time = end - start;
-    std::cout << "\nEnd-to-end execution time: " << execution_time.count() << "s\n";
+    std::cout << "End-to-end execution time: " << execution_time.count() << "s\n";
+
+    std::cout << "MCU Preparer execution time (total): " << mcu_prepare_time.count() << "s\n";
+
+    std::cout << "MCU Offloader execution time (median): " << sum_of_map(execution_times[execution_times.size()/2]).count() << "s\n";
+    std::cout << " - Queue waiting time: " << execution_times[execution_times.size()/2]["wait_time"].count() << "s\n";
+    std::cout << " - CPU-to-DPUs transfer time: " << execution_times[execution_times.size()/2]["cpu_to_dpus_time"].count() << "s\n";
+    std::cout << " - DPU execution time: " << execution_times[execution_times.size()/2]["dpu_execution_time"].count() << "s\n";
+    std::cout << " - DPUs-to-CPU transfer time: " << execution_times[execution_times.size()/2]["dpus_to_cpu_time"].count() << "s\n";
+    std::cout << " - BMP write time: " << execution_times[execution_times.size()/2]["bmp_write_time"].count() << "s\n";
+
+    if(execution_times.size() > 1){
+        std::cout << "MCU Offloader execution time (maximum): " << sum_of_map(execution_times[execution_times.size()-1]).count() << "s\n";
+        std::cout << " - Queue waiting time: " << execution_times[execution_times.size()-1]["wait_time"].count() << "s\n";
+        std::cout << " - CPU-to-DPUs transfer time: " << execution_times[execution_times.size()-1]["cpu_to_dpus_time"].count() << "s\n";
+        std::cout << " - DPU execution time: " << execution_times[execution_times.size()-1]["dpu_execution_time"].count() << "s\n";
+        std::cout << " - DPUs-to-CPU transfer time: " << execution_times[execution_times.size()-1]["dpus_to_cpu_time"].count() << "s\n";
+        std::cout << " - BMP write time: " << execution_times[execution_times.size()-1]["bmp_write_time"].count() << "s\n";
+
+        std::cout << "MCU Offloader execution time (minimum): " << sum_of_map(execution_times[0]).count() << "s\n";
+        std::cout << " - Queue waiting time: " << execution_times[0]["wait_time"].count() << "s\n";
+        std::cout << " - CPU-to-DPUs transfer time: " << execution_times[0]["cpu_to_dpus_time"].count() << "s\n";
+        std::cout << " - DPU execution time: " << execution_times[0]["dpu_execution_time"].count() << "s\n";
+        std::cout << " - DPUs-to-CPU transfer time: " << execution_times[0]["dpus_to_cpu_time"].count() << "s\n";
+        std::cout << " - BMP write time: " << execution_times[0]["bmp_write_time"].count() << "s\n";
+    }
 
     return 0;
 }
