@@ -151,6 +151,7 @@ void dequantize(int tasklet_ID) {
     }
 }
 
+/*
 void idct_component_shift_and_add(int tasklet_ID, int component_ID){
     int result[64];
     int sum, scaling_factor = 17;
@@ -174,6 +175,7 @@ void idct_component_shift_and_add(int tasklet_ID, int component_ID){
         }
     }
 }
+*/
 
 void idct(int tasklet_ID) {
     int start_mcu = tasklet_ID * mcu_per_tasklet;
