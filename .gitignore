@@ -1,4 +1,9 @@
 bin/
 test_images/
 imagenet/
+*.BMP
 *.bmp
+*.JPEG
+*.jpeg
+*.JPG
+*.jpg
