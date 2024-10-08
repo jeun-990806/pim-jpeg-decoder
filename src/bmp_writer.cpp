@@ -49,9 +49,10 @@ void write_BMP(std::vector<uint32_t>& metadata, std::vector<std::vector<short>>&
             const uint pixel_index = pixel_row * 8 + pixel_column;
 
             int mcu_index = mcu_row * metadata[3] + mcu_column;
-            int block_index = ((mcu_index / metadata[3]) / 2) * (metadata[3] / 2) + ((mcu_index % metadata[3]) / 2);
+            int block_index = (mcu_index / (metadata[3] * 2)) * ((metadata[3] + 1) / 2) + ((mcu_index % metadata[3]) / 2);
             int block_position = ((mcu_index / metadata[3]) % 2) * 2 + ((mcu_index % metadata[3]) % 2);
             int dpu_index = block_index / max_blk_per_dpu;
+
             block_index %= max_blk_per_dpu;
 
             output.put(mcus[start_dpu_index + dpu_index][(block_index * 768) + 512 + (block_position * 64) + pixel_index]);    // 2

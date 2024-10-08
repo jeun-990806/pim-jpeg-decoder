@@ -191,22 +191,16 @@ void idct(int tasklet_ID) {
         idct_component(tasklet_ID, 0, 2);
 
         idct_component(tasklet_ID, 1, 0);
-        if(metadata.h_sampling_factor != 2 && metadata.v_sampling_factor == 2){
-            idct_component(tasklet_ID, 1, 1);
-            idct_component(tasklet_ID, 1, 2);
-        }
-
+        idct_component(tasklet_ID, 1, 1);
+        idct_component(tasklet_ID, 1, 2);
+        
         idct_component(tasklet_ID, 2, 0);
-        if(metadata.h_sampling_factor == 2 && metadata.v_sampling_factor != 2){
-            idct_component(tasklet_ID, 2, 1);
-            idct_component(tasklet_ID, 2, 2);
-        }
+        idct_component(tasklet_ID, 2, 1);
+        idct_component(tasklet_ID, 2, 2);
 
         idct_component(tasklet_ID, 3, 0);
-        if(metadata.h_sampling_factor != 2 && metadata.v_sampling_factor != 2){
-            idct_component(tasklet_ID, 3, 1);
-            idct_component(tasklet_ID, 3, 2);
-        }
+        idct_component(tasklet_ID, 3, 1);
+        idct_component(tasklet_ID, 3, 2);
 
         store_block(tasklet_ID, block_index);
     }

@@ -731,7 +731,7 @@ bool decode_Huffman_data(Header *const header, std::vector<std::vector<short>>& 
           for(uint v=0; v<header->color_components[j].v_sampling_factor; v++){
             for(uint h=0; h<header->color_components[j].h_sampling_factor; h++){
                 int mcu_index = (y + v) * header->mcu_width_real + (x + h);
-                int block_index = ((mcu_index / header->mcu_width_real) / 2) * (header->mcu_width_real / 2) + ((mcu_index % header->mcu_width_real) / 2);
+                int block_index = (mcu_index / (header->mcu_width_real * 2)) * ((header->mcu_width_real + 1) / 2) + ((mcu_index % header->mcu_width_real) / 2);
                 int block_position = ((mcu_index / header->mcu_width_real) % 2) * 2 + ((mcu_index % header->mcu_width_real) % 2);
                 int dpu_index = dpu_offset + (block_index / max_blk_per_dpu);
                 block_index %= max_blk_per_dpu;

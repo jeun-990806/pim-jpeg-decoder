@@ -9,7 +9,9 @@
 #include <mutex>
 #include <condition_variable>
 
-#include <chrono>
+#include <sys/stat.h>
+
+#include <time.h>
 
 #include <dpu>
 
@@ -35,9 +37,32 @@ std::mutex mtx;
 std::condition_variable cv;
 bool finished = false;
 
+uintmax_t get_filesize(const std::string& file_path) {
+    struct stat stat_buf;
+    stat(file_path.c_str(), &stat_buf);
+    return stat_buf.st_size;
+}
+
+void sort_by_size(std::vector<std::string>& image_paths) {
+    std::vector<std::pair<uintmax_t, std::string>> images;
+
+    for (const auto& path : image_paths) {
+        uintmax_t filesize = get_filesize(path);
+        images.emplace_back(filesize, path);
+    }
+
+    std::sort(images.begin(), images.end(), [](std::pair<uintmax_t, std::string>& a, std::pair<uintmax_t, std::string>& b) {
+        return a.first < b.first;
+    });
+
+    for (size_t i = 0; i < images.size(); ++i) {
+        image_paths[i] = images[i].second;
+    }
+}
+
+/* Use chrono for profiling
 std::chrono::duration<double> total_execution_time;
 std::chrono::system_clock::time_point execution_start, execution_end;
-std::vector<std::vector<uint32_t>> init_cycles(1, std::vector<uint32_t>(1)), dequantization_cycles(1, std::vector<uint32_t>(1)), idct_cycles(1, std::vector<uint32_t>(1)), color_space_conversion_cycles(1, std::vector<uint32_t>(1));
 int total_offloading_times = 0;
 
 #ifdef DEBUG
@@ -52,11 +77,36 @@ int total_offloading_times = 0;
         return sum;
     }
 #endif
+*/
+
+std::vector<std::vector<uint32_t>> init_cycles(1, std::vector<uint32_t>(1));
+std::vector<std::vector<uint32_t>> dequantization_cycles(1, std::vector<uint32_t>(1));
+std::vector<std::vector<uint32_t>> idct_cycles(1, std::vector<uint32_t>(1));
+std::vector<std::vector<uint32_t>> color_space_conversion_cycles(1, std::vector<uint32_t>(1));
+
+double total_execution_time = 0;
+double mcu_prepare_time = 0;
+double total_queue_waiting_time = 0;
+double total_batch_time = 0;
+double total_cpu_to_dpus_transfer_time = 0;
+double total_dpu_execution_time = 0;
+double total_dpus_to_cpu_transfer_time = 0;
+double total_bmp_write_time = 0;
+int total_offloading_times = 0;
+
+double get_time(struct timespec *start, struct timespec *end){
+    return (end->tv_sec - start->tv_sec) + ((end->tv_nsec - start->tv_nsec) / 1e9);
+}
 
 void mcu_prepare(const std::vector<std::string>& input_files){
+    /* Use chrono for profiling
     #ifdef DEBUG
         auto mcu_prepare_start = std::chrono::high_resolution_clock::now();
     #endif
+    */
+    struct timespec execution_start, execution_end;
+
+    clock_gettime(CLOCK_MONOTONIC, &execution_start);
     std::vector<std::vector<short>> MCU_buffer(nr_dpus, std::vector<short>(MAX_MCU_PER_DPU * 3 * 64));
     std::vector<std::vector<uint32_t>> metadata_buffer;
     std::vector<uint32_t> metadata(20 + 4 * 64);
@@ -72,8 +122,10 @@ void mcu_prepare(const std::vector<std::string>& input_files){
             continue;
         }
 
-        need_dpus = header->mcu_width_real * header->mcu_height_real / MAX_MCU_PER_DPU;
-        if(header->mcu_width_real * header->mcu_height_real % MAX_MCU_PER_DPU != 0) need_dpus += 1;
+        int padded_mcu_width = (header->mcu_width_real + 1) / 2 * 2;
+        int padded_mcu_height = (header->mcu_height_real + 1) / 2 * 2;
+        int total_padded_mcu_count = padded_mcu_width * padded_mcu_height;
+        need_dpus = (total_padded_mcu_count + MAX_MCU_PER_DPU - 1) / MAX_MCU_PER_DPU;
 
         if(need_dpus > free_dpus) {
             metadata_buffer.resize(nr_dpus, std::vector<uint32_t>(20 + 4 * 64));
@@ -147,56 +199,86 @@ void mcu_prepare(const std::vector<std::string>& input_files){
     }
     cv.notify_one();
 
+    clock_gettime(CLOCK_MONOTONIC, &execution_end);
+    mcu_prepare_time = get_time(&execution_start, &execution_end);
+
+    /* Use chrono for profiling
     #ifdef DEBUG
         auto mcu_prepare_end = std::chrono::high_resolution_clock::now();
         mcu_prepare_time = mcu_prepare_end - mcu_prepare_start;
     #endif
+    */
 }
 
 void offloading(){
+    /* Use chrono for profiling
     #ifdef DEBUG
         std::map<std::string, std::chrono::duration<double>> execution_time_breakdown;
     #endif
     execution_start = std::chrono::high_resolution_clock::now();
+    */
 
+    struct timespec execution_start, execution_end;
+    struct timespec tmp_start, tmp_end;
+
+    clock_gettime(CLOCK_MONOTONIC, &execution_start);
     while(true){
         Batch batch;
         {
             std::unique_lock<std::mutex> lock(mtx);
-
+            
+            /* Use chrono for profiling
             #ifdef DEBUG
                 auto queue_waiting_start = std::chrono::high_resolution_clock::now();
             #endif
+            */
+            clock_gettime(CLOCK_MONOTONIC, &tmp_start);
             cv.wait(lock, []{ return !batched_queue.empty() || finished; });
-
+            clock_gettime(CLOCK_MONOTONIC, &tmp_end);
+            total_queue_waiting_time += get_time(&tmp_start, &tmp_end);
+            /* Use chrono for profiling
             #ifdef DEBUG
                 auto queue_waiting_end = std::chrono::high_resolution_clock::now();
                 execution_time_breakdown["queue_wait_time"] = queue_waiting_end - queue_waiting_start;
             #endif
+            */
 
             if (batched_queue.empty() && finished) {
                 break; 
             }
 
+            /* Use chrono for profiling
             #ifdef DEBUG
                 auto batch_start = std::chrono::high_resolution_clock::now();
             #endif
+            */
+            clock_gettime(CLOCK_MONOTONIC, &tmp_start);
             batch = std::move(batched_queue.front());
             batched_queue.pop();
+            clock_gettime(CLOCK_MONOTONIC, &tmp_end);
+            total_batch_time += get_time(&tmp_start, &tmp_end);
+            /* Use chrono for profiling
             #ifdef DEBUG
                 auto batch_end = std::chrono::high_resolution_clock::now();
                 execution_time_breakdown["batch_time"] = batch_end - batch_start;
             #endif
-
+            */
         }
 
         pim.load(DPU_BINARY);
 
+        /* Use chrono for profiling
         #ifdef DEBUG
             auto cpu_to_dpus_start = std::chrono::high_resolution_clock::now();
         #endif
+        */
+        clock_gettime(CLOCK_MONOTONIC, &tmp_start);
         pim.copy("metadata_buffer", batch.metadata);
         pim.copy("mcus", batch.mcus);
+        clock_gettime(CLOCK_MONOTONIC, &tmp_end);
+        total_cpu_to_dpus_transfer_time += get_time(&tmp_start, &tmp_end);
+
+        /* Use chrono for profiling
         #ifdef DEBUG
             auto cpu_to_dpus_end = std::chrono::high_resolution_clock::now();
             execution_time_breakdown["cpu_to_dpus_time"] = cpu_to_dpus_end - cpu_to_dpus_start;
@@ -205,7 +287,13 @@ void offloading(){
         #ifdef DEBUG
             auto dpu_execution_start = std::chrono::high_resolution_clock::now();
         #endif
+        */
+        clock_gettime(CLOCK_MONOTONIC, &tmp_start);
         pim.exec();
+        clock_gettime(CLOCK_MONOTONIC, &tmp_end);
+        total_dpu_execution_time += get_time(&tmp_start, &tmp_end);
+        total_offloading_times += 1;
+        /* Use chrono for profiling
         #ifdef DEBUG
             auto dpu_execution_end = std::chrono::high_resolution_clock::now();
             execution_time_breakdown["dpu_execution_time"] = dpu_execution_end - dpu_execution_start;
@@ -215,11 +303,16 @@ void offloading(){
         #ifdef DEBUG
             auto dpus_to_cpu_start = std::chrono::high_resolution_clock::now();
         #endif
+        */
+        clock_gettime(CLOCK_MONOTONIC, &tmp_start);
         pim.copy(batch.mcus, "mcus");
         pim.dpus()[0]->copy(init_cycles, "initialization");
         pim.dpus()[0]->copy(dequantization_cycles, "dequantization");
         pim.dpus()[0]->copy(idct_cycles, "inverse_dct");
         pim.dpus()[0]->copy(color_space_conversion_cycles, "color_space_conversion");
+        clock_gettime(CLOCK_MONOTONIC, &tmp_end);
+        total_dpus_to_cpu_transfer_time += get_time(&tmp_start, &tmp_end);
+        /* Use chrono for profiling
         #ifdef DEBUG
             auto dpus_to_cpu_end = std::chrono::high_resolution_clock::now();
             execution_time_breakdown["dpus_to_cpu_time"] = dpus_to_cpu_end - dpus_to_cpu_start;
@@ -228,6 +321,8 @@ void offloading(){
         #ifdef DEBUG
             auto bmp_write_start = std::chrono::high_resolution_clock::now();
         #endif
+        */
+        clock_gettime(CLOCK_MONOTONIC, &tmp_start);
         int dpu_offset = 0, nr_allocated_dpus = 0;
         for(int i=0; i<batch.filenames.size(); i++){
             const std::size_t pos = batch.filenames[i].find_last_of('.');
@@ -235,15 +330,23 @@ void offloading(){
             write_BMP(batch.metadata[dpu_offset], batch.mcus, dpu_offset, (pos == std::string::npos) ? (batch.filenames[i] + ".bmp") : (batch.filenames[i].substr(0, pos) + ".bmp"));
             dpu_offset += nr_allocated_dpus;
         }
+        clock_gettime(CLOCK_MONOTONIC, &tmp_end);
+        total_bmp_write_time += get_time(&tmp_start, &tmp_end);
+        /* Use chrono for profiling
         #ifdef DEBUG
             auto bmp_write_end = std::chrono::high_resolution_clock::now();
             execution_time_breakdown["bmp_write_time"] = bmp_write_end - bmp_write_start;
             execution_times.push_back(execution_time_breakdown);
         #endif
+        */
     }
 
+    /* Use chrono for profiling
     execution_end = std::chrono::high_resolution_clock::now();
     total_execution_time = execution_end - execution_start;
+    */
+    clock_gettime(CLOCK_MONOTONIC, &execution_end);
+    total_execution_time = get_time(&execution_start, &execution_end);
 }
 
 int main(int argc, char *argv[]){
@@ -254,6 +357,7 @@ int main(int argc, char *argv[]){
 
     std::vector<std::string> input_files;
     for(int i=1; i<argc; i++) input_files.push_back(argv[i]);
+    sort_by_size(input_files);
     
     std::cout << nr_dpus << " dpus are allocated\n";
 
@@ -263,16 +367,33 @@ int main(int argc, char *argv[]){
     mcu_preparer.join();
     decoding_offloader.join();
 
+    /* Use chrono for profiling
     #ifdef DEBUG
         auto compare = [](const std::map<std::string, std::chrono::duration<double>>& a, const std::map<std::string, std::chrono::duration<double>>& b) {
             return sum_of_map(a) < sum_of_map(b);
         };
         std::sort(execution_times.begin(), execution_times.end(), compare);
     #endif
+    */
 
     std::cout << "\nProfiles:\n";
-    std::cout << "End-to-end execution time: " << total_execution_time.count() << "s\n";
+    // std::cout << "End-to-end execution time: " << total_execution_time.count() << "s\n";
+    std::cout << "End-to-end execution time: " << total_execution_time << "s\n";
 
+    std::cout << "MCU Offloader execution time (total): \n";
+    std::cout << " - Queue waiting time: " << total_queue_waiting_time << "s\n";
+    std::cout << " - Batch time: " << total_batch_time << "s\n";
+    std::cout << " - CPU-to-DPUs transfer time: " << total_cpu_to_dpus_transfer_time << "s\n";
+    std::cout << " - DPU execution time: " << total_dpu_execution_time << "s\n";
+    std::cout << " - DPU execution - Init cycles: " << init_cycles[0][0] << " cycles\n";
+    std::cout << " - DPU execution - Dequantization cycles: " << dequantization_cycles[0][0] << " cycles\n";
+    std::cout << " - DPU execution - IDCT cycles: " << idct_cycles[0][0] << " cycles\n";
+    std::cout << " - DPU execution - Color space conversion cycles: " << color_space_conversion_cycles[0][0] << " cycles\n";
+    std::cout << " - DPUs-to-CPU transfer time: " << total_dpus_to_cpu_transfer_time << "s\n";
+    std::cout << " - BMP write time: " << total_bmp_write_time << "s\n";
+    std::cout << " - Total " << total_offloading_times << " calls\n";    
+
+    /* Use chrono for profiling
     #ifdef DEBUG
         std::chrono::duration<double> total_queue_waiting_time(0), total_batch_time(0), total_cpu_to_dpus_transfer_time(0), total_dpu_execution_time(0), total_dpus_to_cpu_transfer_time(0), total_bmp_write_time(0);
         for(const auto& et : execution_times){
@@ -298,7 +419,6 @@ int main(int argc, char *argv[]){
         std::cout << " - BMP write time: " << total_bmp_write_time.count() << "s\n";
         std::cout << " - Total " << total_offloading_times << " calls\n";
 
-        /*
         std::cout << "MCU Offloader execution time (median): " << sum_of_map(execution_times[execution_times.size()/2]).count() << "s\n";
         std::cout << " - Queue waiting time: " << execution_times[execution_times.size()/2]["queue_wait_time"].count() << "s\n";
         std::cout << " - Batch time: " << execution_times[execution_times.size()/2]["batch_time"].count() << "s\n";
@@ -306,7 +426,6 @@ int main(int argc, char *argv[]){
         std::cout << " - DPU execution time: " << execution_times[execution_times.size()/2]["dpu_execution_time"].count() << "s\n";
         std::cout << " - DPUs-to-CPU transfer time: " << execution_times[execution_times.size()/2]["dpus_to_cpu_time"].count() << "s\n";
         std::cout << " - BMP write time: " << execution_times[execution_times.size()/2]["bmp_write_time"].count() << "s\n";
-        */
 
         if(execution_times.size() > 1){
             std::cout << "MCU Offloader execution time (maximum): " << sum_of_map(execution_times[execution_times.size()-1]).count() << "s\n";
@@ -326,6 +445,7 @@ int main(int argc, char *argv[]){
             std::cout << " - BMP write time: " << execution_times[0]["bmp_write_time"].count() << "s\n";
         }
     #endif
+    */
 
     return 0;
 }
